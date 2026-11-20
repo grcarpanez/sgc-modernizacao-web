@@ -1,0 +1,108 @@
+# =============================================================================
+# PROTEÇÃO DE DADOS SENSÍVEIS (LGPD) E ARTEFATOS LEGADOS
+# JAMAIS remover as regras abaixo para evitar envio de dados reais de clientes.
+# =============================================================================
+
+# 1. Bancos de Dados Reais, Backups e Dumps com Dados de Clientes
+*.FDB
+*.fdb
+*.GBK
+*.gbk
+*.FBK
+*.fbk
+*.BAK
+*.bak
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*dump*.sql
+*backup*.sql
+*dados*.sql
+
+# 2. Binários e Recursos Proprietários do Sistema Legado Desktop (Delphi 7 / Rave)
+*.exe
+*.EXE
+*.dll
+*.DLL
+*.rav
+*.RAV
+*.bmp
+*.BMP
+*.dcu
+*.dfm
+*.res
+
+# 3. Arquivos de Remessa Gráfica, CNAB Bancário e Planilhas Financeiras (Contêm CPF/Nomes)
+REMESSA*
+REMADESAO*
+SEG_VIA*
+*.txt
+*.TXT
+!requirements.txt
+!CMakeLists.txt
+*.ret
+*.RET
+*.rem
+*.REM
+*.cnab
+*.CNAB
+*.xls
+*.XLS
+*.xlsx
+*.XLSX
+*.csv
+*.CSV
+
+# 4. Variáveis de Ambiente, Senhas, Certificados, Chaves Privadas e Regras Locais de IA
+AGENTS.md
+GEMINI.md
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+secrets.*
+credentials.*
+
+# 5. Ambientes Virtuais, Dependências e Builds (Python / Node.js / Java)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+node_modules/
+.next/
+out/
+dist/
+build/
+.turbo/
+
+target/
+*.jar
+*.war
+*.class
+.gradle/
+
+# 6. Arquivos Temporários de Sistema Operacional e IDEs
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp
+*.temp
+*.swp
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
