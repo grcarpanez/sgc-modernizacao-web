@@ -33,7 +33,8 @@
 *.dfm
 *.res
 
-# 3. Arquivos de Remessa Gráfica, CNAB Bancário e Planilhas Financeiras (Contêm CPF/Nomes)
+# 3. Arquivos de Remessa Gráfica, CNAB Bancário, Planilhas e Documentos Auxiliares (Contêm Dados Reais)
+documentos_auxiliares/
 REMESSA*
 REMADESAO*
 SEG_VIA*
