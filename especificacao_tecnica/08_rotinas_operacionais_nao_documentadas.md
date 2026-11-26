@@ -167,18 +167,21 @@
 * **Estratégia Modular de Implantação:** O novo sistema será desenvolvido e colocado em produção **por módulos independentes**, todos compartilhando o mesmo banco de dados oficial PostgreSQL. O **Módulo 1** a entrar no ar será o de **Rede Credenciada / Parceiros** (substituindo as planilhas atuais de listagem e listagem resumida), sendo integrado posteriormente aos módulos de Associados, Financeiro, Autorizações, Clínicas Próprias/Agenda Médica e Portal/App.
 * **Abrangência e Clínicas Próprias:**
   * Qualquer associado de qualquer unidade pode utilizar qualquer parceiro da rede (não há restrição geográfica por unidade do associado); apenas no futuro poderá haver restrição por **plano ou benefício adicional** contratado.
-  * As **Unidades Próprias da Associação** que possuem clínica médica/odontológica/exames também aparecem na rede credenciada (vinculadas a `unidades`), utilizando até **4 faixas de preço internas**: *Particular*, *Associado*, *Parceiros* e *Encaminhamento Prefeitura*.
+  * As **Unidades Próprias da Associação** que possuem clínica médica/odontológica/exames também aparecem na rede credenciada (vinculadas a `unidades`), utilizando a tabela extensível **`convenios`** (nascendo com *Particular*, *Associado*, *Parceiros* e *Encaminhamento Prefeitura*, podendo crescer para N convênios no futuro).
 * **Flexibilidade Total de Modelos de Benefício (4 Cenários):**
-  1. **Valor Fixo** (Particular $\times$ Associado, além de Parceiro e Prefeitura quando aplicável);
+  1. **Valor Fixo** (por convênio em `convenios`: Particular $\times$ Associado, além de Parceiro e Prefeitura quando aplicável);
   2. **Percentual de Desconto Geral (%)** sobre todo o estabelecimento;
   3. **Percentual de Desconto Variável (%)** por subcategoria/grupo de produtos ou serviços;
   4. **Sob Consulta / Tabela Variável** (sem valor ou % fixo, exibindo orientação clara ao associado).
-  * Um mesmo parceiro pode combinar modelos, ter preços diferentes por **local de atendimento (cidade/filial)** e/ou por **profissional** dentro do mesmo estabelecimento.
+* **Modelo de Precificação em Funil e Escada Anti-Empate (`parceiros_precos_beneficios`):**
+  * **Fluxo em Funil (6 Passos):** Na tela de preços do parceiro, os comboboxes filtram em cascata (1. Parceiro $\to$ 2. Local [Todos da Rede ou 1 Filial] $\to$ 3. Especialidade ativa naquele parceiro/local $\to$ 4. Profissional ativo naquele local/especialidade $\to$ 5. Procedimento do catálogo ou descrição livre $\to$ 6. Convênio e preço), sem exigir cadastro prévio de procedimentos por filial e sem precisar duplicar nomes genéricos no catálogo (um único `CONSULTA` é reutilizado com qualquer especialidade: médica, odontológica, jurídica, etc.).
+  * **Escada Anti-Empate de 3 Degraus (Zero Empates):** Preço específico de profissional **sempre exige um local definido** (`profissional_id IS NULL OR local_id IS NOT NULL`), garantindo hierarquia estrita sem empates: **3º Profissional na Filial** $\to$ **2º Padrão da Filial** $\to$ **1º Padrão da Rede** *(com atalho na UI para replicar o preço de um profissional em todas as filiais onde ele atende, gravando 1 linha por filial)*.
+  * **Zero Duplicidade e Zero Linha Vazia:** O banco impede duas regras ativas duplicadas para a mesma combinação e exige pelo menos Especialidade, Procedimento ou Descrição preenchidos.
 * **Conformidade Legal (CRM e LGPD):**
   * **Regra Crítica do CRM (Proibição de Divulgação Pública de Preços):** O servidor/API **jamais** envia valores (R\$) ou percentuais (%) em rotas públicas ou no Guia PDF enviado ao associado quando o cadeado `bloqueio_divulgacao_valores` estiver ativo (padrão `TRUE` para todo cadastro, destravável **exclusivamente por `ADMINISTRADOR`**). A tabela resumida com menores preços é **estritamente interna**.
   * **Separação LGPD (`LGPD.pdf`):** Dados particulares/pessoais do profissional e contatos internos (`parceiros_contatos`) ficam isolados do guia público; redes sociais (Instagram, Facebook e WhatsApp) possuem permissão individual (`SIM`/`NÃO`) de divulgação, e o sistema deve gerar o **Termo LGPD em PDF** para assinatura e arquivamento em `parceiros_documentos`.
 * **Governança e Manutenção da Rede:**
-  * Controle de **duas datas independentes** (`dados_atualizados_em` e `tabela_atualizada_em`) com alertas automáticos de revisão semestral (6 meses);
+  * Controle de **duas datas independentes** (`cadastro_atualizado_em` e `precos_atualizados_em`) com alertas automáticos de revisão semestral (6 meses) e botão de confirmação quando não houver alteração;
   * Permissão interna segregada para alteração de tabelas de preços (todos os colaboradores autorizados visualizam valores internos, mas apenas perfis com permissão podem alterar);
   * **Histórico dedicado de reajustes** (`parceiros_precos_historico`) além da auditoria geral;
   * **Destaques:** Separação entre **Destaque Editorial Interno** (menores preços / mais procurados) e **Destaque Patrocinado** (propaganda paga com escopo geral ou por cidade/categoria e data de validade automática);

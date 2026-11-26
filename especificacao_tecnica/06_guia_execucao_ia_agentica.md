@@ -6,7 +6,7 @@
 
 ## 1. Regras Inegociáveis para o Agente Construtor (Invariantes do Domínio)
 
-Qualquer agente de IA que implemente este sistema **DEVE** obedecer rigorosamente às 10 regras abaixo:
+Qualquer agente de IA que implemente este sistema **DEVE** obedecer rigorosamente às 12 regras abaixo:
 
 1. **Aritmética Monetária Exata:** Jamais usar `float` ou `double` binário IEEE-754 para valores monetários, percentuais de comissão ou tarifas. Usar exclusivamente `Decimal` (`Python decimal.Decimal` com `ROUND_HALF_UP`) ou `BigDecimal` (`Java math.BigDecimal` com `RoundingMode.HALF_UP`) e `NUMERIC(12,2)` no PostgreSQL.
 2. **Unicidade Global do Número de Adesão (`adesoes.numero`):** O número de adesão é compartilhado entre **Clientes PF (`clientes_pf`)** e **Empresas Clientes PJ (`clientes_pj`)** através da supertabela `adesoes` alimentada por `seq_adesao_numero` (sincronizada após migração com `MAX(NUMERO) + 1`).
@@ -28,6 +28,8 @@ Qualquer agente de IA que implemente este sistema **DEVE** obedecer rigorosament
    - Aplicar autorização RBAC no servidor em **100% das rotas** (corrigindo os 7 menus desprotegidos do legado).
 9. **Idempotência de Lotes e Retornos Bancários:** O reenvio do mesmo arquivo `.ret` CNAB 240 ou planilha Excel não pode duplicar baixas nem sobrescrever baixas já conciliadas sem flag explícita; registrar hash SHA-256 de cada arquivo processado em `lotes_arquivos`.
 10. **Zero Uso dos Ícones `.bmp` Legados:** Não importar `atualizar.bmp`, `Cancelar.bmp`, `Consultar.bmp`, `Excluir.bmp`, `Fechar.bmp`, `fg.bmp` ou `novo.bmp`. Utilizar biblioteca moderna de ícones SVG (`lucide-react`).
+11. **Segurança no Upload e Armazenamento de Documentos (Zero Execução no Servidor):** Todo documento ou anexo enviado ao sistema (`documentos_adesao`, `parceiros_documentos`, logomarcas e banners) deve passar por validação rigorosa de assinatura binária (*magic bytes*) confirmando que o cabeçalho real do arquivo condiz com a extensão permitida em lista fechada (PDF, JPG, PNG), com limite de tamanho e geração de `sha256_hash`. **Nenhum arquivo anexado é lido, interpretado ou executado pelo servidor**: ele é apenas armazenado com chave aleatória (UUID) em Storage externo isolado (S3/R2/Supabase) e servido com cabeçalhos seguros (`X-Content-Type-Options: nosniff` e `Content-Disposition`).
+12. **Precificação de Parceiros Sem Empates e Fluxo em Funil (`parceiros_precos_beneficios`):** O cadastro de preços/descontos da Rede Credenciada e Clínicas Próprias deve seguir obrigatoriamente a **Escada Anti-Empate de 3 Degraus** (`CHECK (profissional_id IS NULL OR local_id IS NOT NULL)` — Degrau 3 Profissional na Filial $\to$ Degrau 2 Padrão da Filial $\to$ Degrau 1 Padrão da Rede), exigir ao menos `procedimento_id`, `subcategoria_id` ou `descricao_beneficio`, bloquear duplicidades ativas (`UNIQUE NULLS NOT DISTINCT ... WHERE ativo = TRUE`), reutilizar procedimentos genéricos (`CONSULTA` com `subcategoria_id = NULL` em `catalogo_procedimentos`) sem duplicar nomes por especialidade, e apresentar o **Fluxo em Funil de 6 Passos** em cascata na UI e validações espelhadas no backend.
 
 ---
 

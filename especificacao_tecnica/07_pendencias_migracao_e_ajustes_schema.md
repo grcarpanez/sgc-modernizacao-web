@@ -175,6 +175,7 @@
 
 ### 1.13 Papel de `auditoria_eventos` vs. Histórico de Benefícios e 2ª Via
 * **`auditoria_eventos` (Escopo Global Técnico):** Mantida exclusivamente como trilha forense/técnica do sistema inteiro (logins, logouts, criações, edições com `dados_anteriores`/`dados_novos`, baixas, estornos, cancelamentos, reativações, remessas e mudanças de plano/dependentes).
+  * **Filtros Obrigatórios de Consulta:** Os logs devem poder ser filtrados por **data**, **intervalo de data**, **login (usuário)**, **tipo de evento** e **entidade**.
 * **Histórico de 2ª Via e Uso de Benefícios (Escopo de Negócio/Futuro):**
   * Solicitações de 2ª via de carnê e carteirinha podem ser rastreadas via `fila_segunda_via` (preservando histórico de solicitações, não apenas fila volátil);
   * Quando o módulo de **Parceiros / Empresas Credenciadas** for implementado, criar tabela dedicada de **autorizações / utilização de benefícios** (com parceiro, associado/dependente, valor tabela vs. valor com desconto e economia gerada) para viabilizar o relatório de **economia anual do associado**, sem misturar esses dados de negócio com o log técnico de `auditoria_eventos`.
@@ -208,6 +209,9 @@
 ### 1.16 Nova Tabela `documentos_adesao` (Anexos Digitais do Cadastro)
 * **Objetivo:** Armazenar metadados e ponteiros (no Storage S3/R2/Supabase, **não** `BYTEA` no banco) dos documentos digitalizados do associado/empresa (Ficha de Adesão, Contrato Assinado, CNH/CPF, Termos de Reativação/Cancelamento).
 * **Estrutura Prevista:** `id`, `num_adesao` (`REFERENCES adesoes(numero)`), `tipo_documento` (`FICHA_ADESAO`, `CONTRATO_ASSINADO`, `TERMO_REATIVACAO`, `TERMO_CANCELAMENTO`, `DOC_PESSOAL`, `OUTRO`), `nome_arquivo`, `mime_type`, `tamanho_bytes`, `storage_key`, `sha256_hash`, `observacao`, `created_at`, `created_by`.
+* **Regra de Segurança Inegociável (Validação de Cabeçalho e Zero Execução no Servidor):**
+  * **Verificação de Assinatura Binária (*Magic Bytes*):** Todo documento importado deve ter seu cabeçalho binário inspecionado pelo backend para confirmar que o conteúdo real condiz com a extensão e o `mime_type` permitidos (lista fechada segura, ex.: PDF, JPG, PNG), rejeitando arquivos disfarçados, extensões duplas, executáveis ou scripts.
+  * **Armazenamento Isolado e Sem Execução:** Nenhum documento anexado (`documentos_adesao`, `parceiros_documentos`, logomarcas ou banners) é lido, interpretado ou executado pelo servidor — é tratado como blob binário opaco, gravado com `storage_key` aleatório (UUID) em Storage externo isolado (nunca em diretório executável), com limite de tamanho, registro de `sha256_hash` e entrega segura (`X-Content-Type-Options: nosniff` e `Content-Disposition`).
 
 ---
 
@@ -294,41 +298,561 @@
 
 ### 1.24 Padronização da Tabela `auditoria_eventos`
 * **Auditoria:** Padronizar **`usuario_id` $\to$ `created_by`** (e atualizar o índice `idx_auditoria_usuario` para usar `created_by`).
+* **Filtros Obrigatórios e Índices de Consulta (`/auditoria`):**
+  * Suportar pesquisa combinada por **data**, **intervalo de data** (`created_at`), **login (usuário)** (`created_by` vinculado a `usuarios.apelido`), **tipo de evento** (`acao`) e **entidade** (`entidade` / `entidade_id`).
+  * Além de `idx_auditoria_entidade (entidade, entidade_id, created_at DESC)` e `idx_auditoria_usuario (created_by, created_at DESC)`, adicionar:
+    * **`idx_auditoria_created_at`** em `(created_at DESC)` para buscas globais por data ou intervalo de datas;
+    * **`idx_auditoria_acao`** em `(acao, created_at DESC)` para buscas por tipo de evento no período.
+  * **Dicionário Oficial de Tipos de Evento (`acao`):**
+
+| Categoria | Código (`acao`) | O que Registra e Quando é Disparado |
+|---|---|---|
+| **Segurança e Acesso** | `LOGIN` | Entrada bem-sucedida de qualquer perfil (`ADMINISTRADOR`, `COLABORADOR`, Associado, Dependente, Empresa PJ, Parceiro) |
+| **Segurança e Acesso** | `LOGOUT` | Saída voluntária ou encerramento de sessão por expiração |
+| **Segurança e Acesso** | `LOGIN_FALHA` | Tentativa de login com usuário/CPF/CNPJ ou senha inválidos (registra `ip_origem` e `user_agent`) |
+| **Segurança e Acesso** | `BLOQUEIO_USUARIO` | Bloqueio automático da conta por tentativas massivas de senha errada ou bloqueio manual pelo Administrador |
+| **Segurança e Acesso** | `BLOQUEIO_IP` | Bloqueio de endereço IP por tentativas massivas, força bruta ou comportamento suspeito |
+| **Segurança e Acesso** | `DESBLOQUEIO_SEGURANCA` | Desbloqueio manual (pelo Administrador) ou automático (após tempo de espera) de usuário ou IP |
+| **Segurança e Acesso** | `SENHA_ALTERADA` | Troca de senha realizada pelo próprio usuário *(sem gravar a senha em texto)* |
+| **Segurança e Acesso** | `SENHA_REDEFINIDA` | Reset/redefinição de senha feito pelo Administrador ou via fluxo de recuperação de senha |
+| **Segurança e Acesso** | `PERMISSAO_ALTERADA` | Alteração de perfil (`role`), unidade(s) autorizada(s) ou permissões RBAC de um usuário |
+| **Segurança e Acesso** | `ACESSO_NEGADO` | Tentativa bloqueada de acessar rota, operação ou registro de outra unidade/titularidade sem permissão |
+| **Cadastro e LGPD** | `CREATE` | Criação de novo registro (cliente, dependente, empresa PJ, plano, parceiro, usuário, etc.) |
+| **Cadastro e LGPD** | `UPDATE` | Edição de registro existente, gravando obrigatoriamente `dados_anteriores` e `dados_novos` |
+| **Cadastro e LGPD** | `DELETE` | Exclusão lógica (*soft delete*) ou desativação de registro (ex.: dependente, contato, documento) |
+| **Cadastro e LGPD** | `UPLOAD_DOCUMENTO` | Envio de anexo digital (`documentos_adesao`, `parceiros_documentos`) com `sha256_hash` |
+| **Cadastro e LGPD** | `DOWNLOAD_DOCUMENTO` | Visualização ou download de documento sensível anexado (rastreabilidade LGPD) |
+| **Cadastro e LGPD** | `EXPORTACAO_RELATORIO` | Exportação de relatório em PDF, XLSX ou CSV contendo dados de clientes ou financeiros (LGPD) |
+| **Cadastro e LGPD** | `TERMO_LGPD_ACEITO` | Aceite formal de termo de privacidade/LGPD por Parceiro ou Associado (com data/hora e IP) |
+| **Financeiro** | `BAIXA` | Liquidação de parcela/título (manual no balcão, retorno CNAB 240 ou planilha) |
+| **Financeiro** | `ESTORNO` | Cancelamento de baixa/pagamento anteriormente registrado (incluindo reversão de cascata `'UNICA'`) |
+| **Financeiro** | `REMESSA` | Geração de lote de cobrança bancária (CNAB 240) ou lote de impressão em PDF (carnês, etiquetas, carteirinhas) |
+| **Financeiro** | `RETORNO_PROCESSADO` | Importação e processamento de arquivo de retorno bancário (`.ret`) ou planilha de baixas |
+| **Financeiro** | `RENEGOCIACAO` | Formalização de acordo parcelado ou consolidação de parcelas vencidas |
+| **Financeiro** | `AUTORIZACAO_EXCECAO` | Liberação por alçada de Gerente/Administrador (senha presencial ou código único) para desconto ou perdão de dívida |
+| **Contratos e Portais** | `CANCELAMENTO` | Cancelamento formal de contrato PF ou PJ (com motivo e quem executou) |
+| **Contratos e Portais** | `REATIVACAO` | Reativação de ex-cliente PF ou ex-empresa PJ |
+| **Contratos e Portais** | `MUDANCA_PLANO` | Troca de plano ou alteração de benefícios adicionais vinculados ao contrato/dependente |
+| **Contratos e Portais** | `SOLICITACAO_ABERTA` | Abertura de protocolo pelo titular PF, dependente PF/PJ, empresa PJ ou operador (`solicitacoes_movimentacao`) |
+| **Contratos e Portais** | `SOLICITACAO_APROVADA` | Aprovação/execução de uma solicitação de movimentação pela equipe interna |
+| **Contratos e Portais** | `SOLICITACAO_REJEITADA` | Recusa fundamentada de uma solicitação de movimentação |
 
 ---
 
 ### 1.25 Módulo de Rede Credenciada / Parceiros e Clínicas Próprias (Módulo 1 — Primeira Entrega em Produção)
-* **Objetivo Arquitetural:** Criar a estrutura completa e normalizada para gerenciar parceiros credenciados (de padarias a médicos/hospitais) **e também as Clínicas Próprias das Unidades da Associação**, servindo como **Módulo 1** a entrar em produção de forma independente sobre o banco oficial PostgreSQL.
-* **Pré-Cadastros Padronizados (evitam duplicidade de digitação):**
-  1. **`categorias_parceiros`**: Grupos principais (`id`, `nome`, `tipo` [`SAUDE`, `COMERCIO_SERVICOS`, `OUTRO`], `ordem`, `ativo`, auditoria `created_at`/`updated_at`/`created_by`/`updated_by`).
-  2. **`subcategorias_parceiros`**: Especialidades médicas/odontológicas e ramos comerciais vinculados a `categorias_parceiros` (`id`, `categoria_id`, `nome`, `observacoes`, `ativo`, auditoria).
-  3. **`catalogo_procedimentos`**: Pré-cadastro de procedimentos/serviços/itens (`id`, `subcategoria_id` opcional, `nome`, `duracao_padrao_min` opcional, `preparo_necessario` opcional — aproveitando campos já planejados em `ABBAC Cadastro 2026.xlsm` para futura Agenda Médica —, `ativo`, auditoria).
-  4. **`profissionais`**: Cadastro único de profissionais de saúde/autônomos (`id`, `nome`, `cpf`, `conselho_tipo` [CRM/CRO/CRP/CREFITO/OAB/etc.], `conselho_numero`, `conselho_uf`, **dados particulares internos separados** [`endereco_pessoal`, `cep_pessoal`, `telefone_pessoal1`, `telefone_pessoal2`], `email`, `ativo`, auditoria) + tabela N:M **`profissional_subcategorias`** (especialidades do profissional).
-* **Cadastro Principal, Locais, Vínculos, Contatos Internos e Documentos:**
-  5. **`parceiros`**:
-     * `id`, `tipo_parceiro` (`ESTABELECIMENTO_PJ`, `PROFISSIONAL_PF`, `UNIDADE_PROPRIA`), `unidade_propria_id` (opcional -> `unidades(id)`), `profissional_titular_id` (opcional -> `profissionais(id)`), `cpf_cnpj`, `razao_social`, `nome_fantasia`, `exige_autorizacao BOOLEAN NOT NULL DEFAULT FALSE`, `observacoes_atendimento` (público), `observacoes_internas` (privado);
-     * **Trava Dupla CRM (Privacidade de Preços):** `bloqueio_divulgacao_valores BOOLEAN NOT NULL DEFAULT TRUE` (**somente `ADMINISTRADOR` pode alterar**) e `exibir_valores_guia_publico BOOLEAN NOT NULL DEFAULT FALSE` com constraint `CHECK (NOT exibir_valores_guia_publico OR NOT bloqueio_divulgacao_valores)` (garantindo que nunca vaze preço/desconto de médico ou item bloqueado no guia público);
-     * **Controle de Vigência e Revisão Semestral:** `lgpd_aceito_em`, `dados_atualizados_em TIMESTAMPTZ`, `tabela_atualizada_em TIMESTAMPTZ` + **índices dedicados** em `dados_atualizados_em` e `tabela_atualizada_em` para alertas de conferência a cada 6 meses;
-     * `ativo`, auditoria (`created_at`, `updated_at`, `created_by`, `updated_by`).
-  6. **`parceiros_subcategorias`**: Vínculo N:M entre `parceiros` e `subcategorias_parceiros`.
-  7. **`parceiros_locais`** (Locais Públicos de Atendimento — 1:N com `parceiros`):
-     * `id`, `parceiro_id`, `nome_local`, `endereco`, `end_numero`, `complemento`, `bairro`, `cidade`, `estado`, `cep`;
-     * **Contatos Públicos:** `telefone_publico1` (+ `telefone_publico1_whatsapp`), `telefone_publico2` (+ `telefone_publico2_whatsapp`), `email_publico`;
-     * **Redes Sociais com Consentimento LGPD Individual (`LGPD.pdf`):** `instagram`, `permite_divulgar_instagram BOOLEAN NOT NULL DEFAULT FALSE`, `facebook`, `permite_divulgar_facebook BOOLEAN NOT NULL DEFAULT FALSE`, `whatsapp_divulgacao`, `permite_divulgar_whatsapp BOOLEAN NOT NULL DEFAULT FALSE`;
-     * **Horário e Geolocalização Futura (Mapa por Proximidade):** `horario_funcionamento_texto`, `horario_funcionamento_json JSONB` (opcional, p/ futuro filtro "Aberto agora"), `latitude NUMERIC(10, 7)` (opcional, preenchida automaticamente via geocodificação/link), `longitude NUMERIC(10, 7)` (opcional), `google_maps_url` (opcional);
-     * `ativo`, auditoria + índices em `(estado, cidade, bairro)` e `(latitude, longitude) WHERE latitude IS NOT NULL AND longitude IS NOT NULL`.
-  8. **`parceiros_profissionais`**: Vínculo **opcional** N:M entre `parceiros`, `parceiros_locais` (opcional) e `profissionais`, permitindo que um estabelecimento adicione os profissionais que atendem lá (sem ser obrigatório) e que um mesmo profissional atenda em múltiplos estabelecimentos/unidades.
-  9. **`parceiros_contatos`**: Tabela dedicada (mesma estrutura de `clientes_pj_contatos`) para múltiplos contatos **internos/particulares** do parceiro (secretária, gerente, financeiro) — **nunca** expostos no guia público.
-  10. **`parceiros_documentos`**: Anexos no Storage em nuvem (`CONTRATO_CREDENCIAMENTO`, `TERMO_LGPD_ASSINADO`, `TABELA_PRECOS_PDF`, `LOGOMARCA`, `BANNER_PATROCINIO`, `OUTRO`) no mesmo padrão de `documentos_adesao`.
-* **Tabelas de Preços/Descontos (4 Cenários + 4 Faixas das Unidades Próprias), Histórico e Destaques:**
-  11. **`parceiros_precos_beneficios`**:
-      * `id`, `parceiro_id`, `local_id` (opcional -> `parceiros_locais(id)`, permite preços diferentes por cidade/filial), `profissional_id` (opcional -> `profissionais(id)`, permite preços/descontos diferentes por médico dentro da mesma clínica), `subcategoria_id` (opcional), `procedimento_id` (opcional -> `catalogo_procedimentos(id)`);
-      * `tipo_precificacao` (`VALOR_FIXO`, `PERCENTUAL_DESCONTO`, `SOB_CONSULTA`);
-      * **Até 4 Faixas Monetárias (opcionais):** `valor_particular`, `valor_associado`, `valor_parceiro`, `valor_prefeitura` (`NUMERIC(12,2)`);
-      * `percentual_desconto NUMERIC(5,2)`, `descricao_beneficio`, `regras_pagamento`, `observacoes`, `vigencia_inicio DATE`, `ativo`, auditoria.
-  12. **`parceiros_precos_historico`**: Tabela dedicada para histórico de reajustes (`id`, `preco_beneficio_id`, `parceiro_id`, valores/percentuais anteriores e novos, `motivo`, `alterado_em`, `alterado_por_usuario_id`) — além do log técnico em `auditoria_eventos`.
-  13. **`parceiros_planos_elegiveis`** *(preparado para o futuro)*: Vínculo opcional entre `parceiro_id`/`preco_beneficio_id` e `plano_id`/`beneficio_adicional_id`. Quando vazio, qualquer associado de qualquer unidade tem direito; quando preenchido no futuro, restringe benefícios exclusivos a determinados planos/adicionais.
-  14. **`parceiros_destaques`**: `id`, `tipo_destaque` (`EDITORIAL_INTERNO`, `PATROCINADO`), `parceiro_id`, `profissional_id` (opcional), `preco_beneficio_id` (opcional), `subcategoria_id` (opcional), `escopo` (`GERAL`, `CIDADE`, `CATEGORIA`, `CIDADE_CATEGORIA`), `cidade` (opcional), `estado` (opcional), `nivel_patrocinio`, `texto_promocional`, `banner_storage_key`, `ordem`, `data_inicio`, `data_fim`, `ativo`, auditoria.
+
+* **Objetivo Arquitetural:** Criar uma estrutura completa, normalizada e sem ambiguidades para gerenciar **parceiros credenciados** (de comércios locais a redes nacionais, médicos e hospitais) e as **Clínicas Próprias das Unidades da Associação**, servindo como **Módulo 1** a entrar em produção de forma independente sobre o banco oficial PostgreSQL.
+* **Convenções Gerais deste Módulo:**
+  * **Chaves Primárias:** `BIGSERIAL PRIMARY KEY` nas tabelas principais; **chave primária composta** nas tabelas puras de ligação (`5`, `8`, `10`, `13`), impedindo vínculos duplicados na raiz.
+  * **Auditoria Padrão:** Tabelas editáveis possuem `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `created_by BIGINT REFERENCES usuarios(id)`, `updated_by BIGINT REFERENCES usuarios(id)`. Tabelas puras de ligação, anexos e histórico imutável possuem `created_at` e `created_by` (ou `alterado_em`/`alterado_por_usuario_id` no histórico).
+  * **Normalização de Texto:** `MAIÚSCULAS, SEM ACENTOS E SEM CARACTERES ESPECIAIS` (`A-Z`, `0-9` e espaços) em campos de texto de negócio, preservando formato original apenas em exceções técnicas (e-mails, URLs, chaves de Storage e redes sociais como `@instagram`).
+  * **Comentários no `.sql`:** Ao refatorar o `02_schema_postgresql_moderno.sql`, transcrever as descrições dos campos não óbvios como comentários inline (`-- ...`) e `COMMENT ON COLUMN` / `COMMENT ON TABLE` (Protocolo 3, item 5).
+
+---
+
+#### 1.25.1 Mapa Geral das 18 Tabelas
+
+| Nº | Bloco | Tabela | Papel Resumido | Visibilidade |
+| :---: | :--- | :--- | :--- | :--- |
+| **1** | Pré-Cadastro | `categorias` | Grandes grupos cadastráveis pelo `ADMINISTRADOR` (ex.: *Saúde*, *Comércio e Serviços*, *Educação*...) com ordem de exibição | Público |
+| **2** | Pré-Cadastro | `subcategorias` | Especialidades médicas/odontológicas e ramos comerciais | Público |
+| **3** | Pré-Cadastro | `catalogo_procedimentos` | Lista padrão de consultas, exames e serviços (pronta p/ agenda futura) | Misto |
+| **4** | Pré-Cadastro | `profissionais` | Cadastro único da pessoa física (CRM/CRO/OAB, CPF e contatos pessoais sigilosos) | Misto *(dados pessoais sigilosos)* |
+| **5** | Pré-Cadastro | `profissionais_subcategorias` | Liga o profissional às suas várias especialidades | Público |
+| **6** | Pré-Cadastro | `convenios` | Cadastro extensível de convênios/faixas de atendimento (*Particular*, *Associado*, *Parceiro*, *Prefeitura* e futuros) | Misto |
+| **7** | Parceiros | `parceiros` | Ficha principal do convênio (Empresa PJ, Autônomo PF ou Clínica Própria), travas CRM e revisão semestral | Misto |
+| **8** | Parceiros | `parceiros_subcategorias` | Especialidades **gerais da rede** (valem para **todos** os endereços do parceiro) | Público |
+| **9** | Parceiros | `parceiros_locais` | Endereços/filiais de atendimento, telefones públicos, redes sociais (LGPD), horários e mapa | Público |
+| **10** | Parceiros | `parceiros_locais_subcategorias` | Especialidades **exclusivas de uma filial** (para filiais que atendem serviços diferentes) | Público |
+| **11** | Parceiros | `parceiros_profissionais` | Lista de escala opcional (com `ativo`): liga profissional ao parceiro e, opcionalmente, a uma filial | Público |
+| **12** | Parceiros | `parceiros_contatos` | Contatos internos/particulares (secretária, gerente, financeiro) com abrangência geral ou por filiais | **Interno / Sigiloso** |
+| **13** | Parceiros | `parceiros_contatos_locais` | Liga um contato interno específico (`abrange_todos_locais = FALSE`) a 1 ou N filiais | **Interno / Sigiloso** |
+| **14** | Parceiros | `parceiros_documentos` | Anexos no Storage em nuvem (contrato, termo LGPD, tabela em PDF, logomarca, banner) | Misto |
+| **15** | Pré-Cadastro | `tipos_documento_parceiro` | Cadastro extensível de tipos de documentos de parceiros (substitui o antigo ENUM fixo) | Misto |
+| **16** | Preços/Guia | `parceiros_precos_beneficios` | Caderno de preços/descontos por `convenio_id`, com `local_id` (todas ou 1 unidade), `profissional_id` e `procedimento_id` opcionais | Controlado pela Trava CRM |
+| **17** | Preços/Guia | `parceiros_precos_historico` | Histórico imutável de reajustes de preço/desconto por tabela de preço | **Interno** |
+| **18** | Preços/Guia | `parceiros_planos_elegiveis` | *(Futura)* Restringe parceiro ou benefício a planos/adicionais específicos (vazio = todos elegíveis) | Interno / Regra de Guia |
+| **19** | Preços/Guia | `parceiros_destaques` | Destaques editoriais ou patrocinados no guia (parceiro e `local_id` opcional, por cidade/categoria/geral) | Público |
+
+---
+
+#### 1.25.2 Listas de Opções Fixas (`ENUM`s do Módulo)
+
+* `tipo_parceiro_enum`: `'ESTABELECIMENTO_PJ'`, `'PROFISSIONAL_PF'`, `'UNIDADE_PROPRIA'`
+* `tipo_precificacao_enum`: `'VALOR_FIXO'`, `'PERCENTUAL_DESCONTO'`, `'SOB_CONSULTA'`
+* `tipo_destaque_parceiro_enum`: `'EDITORIAL_INTERNO'`, `'PATROCINADO'`
+* `escopo_destaque_parceiro_enum`: `'GERAL'`, `'CIDADE'`, `'CATEGORIA'`, `'CIDADE_CATEGORIA'`
+
+---
+
+#### 1.25.3 Especificação Detalhada das 18 Tabelas
+
+##### 1. `categorias`
+* **Para que serve:** Agrupa as grandes áreas da rede credenciada (ex.: *Saúde*, *Odontologia*, *Comércio e Serviços*, *Educação*, *Lazer*). **Cadastro livre e gerenciado exclusivamente pelo `ADMINISTRADOR`** (sem `ENUM` fixo).
+* **Visibilidade:** Público no Guia.
+* **Relacionamento:** 1 Categoria possui várias Subcategorias (`subcategorias.categoria_id`).
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único da categoria |
+| `nome` | `VARCHAR(100)` | `NOT NULL UNIQUE` | Nome da categoria principal (maiúsculas, sem acentos e sem caracteres especiais) |
+| `ordem` | `INTEGER` | `NOT NULL DEFAULT 100` | Posição numérica de exibição nas telas, listas e guia público (recomenda-se `10, 20, 30...` para encaixes futuros) |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se a categoria aparece para novos cadastros e no guia |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade de criação e última alteração |
+
+* **Travas e Índices:** `UNIQUE (nome)`; índice em `(ativo, ordem, nome)` para ordenação instantânea nas telas e no guia.
+
+---
+
+##### 2. `subcategorias`
+* **Para que serve:** Lista padronizada de especialidades médicas/odontológicas e ramos comerciais (evita digitar *Cardiologia*, *Cardio* e *Cardiologista* separados).
+* **Visibilidade:** Público no Guia.
+* **Relacionamento:** Pertence a 1 Categoria (`categoria_id -> categorias(id)`).
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único da subcategoria/especialidade |
+| `categoria_id` | `BIGINT` | `NOT NULL REFERENCES categorias(id)` | Categoria principal à qual pertence |
+| `nome` | `VARCHAR(120)` | `NOT NULL` | Nome da especialidade ou ramo comercial |
+| `observacoes` | `TEXT` | Opcional | Notas de uso interno ou descrição complementar |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se está ativa |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:** `UNIQUE (categoria_id, nome)`; índice em `(categoria_id)` e índice parcial `WHERE ativo = TRUE`.
+
+---
+
+##### 3. `catalogo_procedimentos`
+* **Para que serve:** Pré-cadastro padronizado de consultas, exames e serviços (aproveitando campos já planejados em `ABBAC Cadastro 2026.xlsm` para futura Agenda Médica). Procedimentos genéricos que atendem múltiplas áreas (ex.: `CONSULTA`, `TRATAMENTO DE UNHA ENCRAVADA`) ficam cadastrados **uma única vez** com `subcategoria_id = NULL` e são combinados com a especialidade no momento de precificar — evitando duplicação artificial de nomes (como criar `CONSULTA CARDIOLOGIA`, `CONSULTA OFTALMOLOGIA`, `CONSULTA JURIDICA` etc.).
+* **Visibilidade:** Misto (nome e preparo podem ir ao guia; duração auxilia a futura agenda).
+* **Relacionamento:** Opcionalmente vinculado a 1 Subcategoria (`subcategoria_id -> subcategorias(id)`), apenas como etiqueta de organização do catálogo (**jamais** como trava rígida que proíba combinar um procedimento com outras especialidades em `parceiros_precos_beneficios`).
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do procedimento |
+| `subcategoria_id` | `BIGINT` | Opcional `REFERENCES subcategorias(id)` | Especialidade associada (opcional para itens genéricos) |
+| `nome` | `VARCHAR(160)` | `NOT NULL` | Nome padronizado do procedimento/exame/serviço |
+| `duracao_padrao_min` | `INTEGER` | Opcional (`CHECK > 0`) | Duração média em minutos (preparado para futura Agenda Médica) |
+| `preparo_necessario` | `TEXT` | Opcional | Instruções de preparo ao paciente (ex.: jejum de 8h) |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se o procedimento está ativo |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:** `UNIQUE NULLS NOT DISTINCT (subcategoria_id, nome)`; índice trigrama (`GIN gin_trgm_ops`) em `nome` para busca rápida por texto.
+
+---
+
+##### 4. `profissionais`
+* **Para que serve:** Cadastro único de pessoas físicas que atendem (médicos, dentistas, psicólogos, fisioterapeutas, advogados), evitando duplicar o profissional quando ele atende em várias clínicas.
+* **Visibilidade:** Misto — **Nome e Conselho (CRM/CRO/etc.) são públicos**; **CPF, endereço pessoal e telefones pessoais são estritamente internos (LGPD)**.
+* **Relacionamento:** Pode ter várias especialidades (`profissionais_subcategorias`) e atender em vários parceiros/locais (`parceiros_profissionais`), além de poder ser titular de um cadastro de Parceiro PF (`parceiros.profissional_titular_id`).
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do profissional |
+| `nome` | `VARCHAR(150)` | `NOT NULL` | Nome completo do profissional |
+| `cpf` | `VARCHAR(11)` | Opcional `UNIQUE` | CPF validado (11 dígitos) — uso interno/LGPD |
+| `conselho_tipo` | `VARCHAR(20)` | Opcional | Sigla do conselho de classe (`CRM`, `CRO`, `CRP`, `CREFITO`, `CRN`, `OAB`, etc.) |
+| `conselho_numero` | `VARCHAR(30)` | Opcional | Número do registro no conselho profissional |
+| `conselho_uf` | `CHAR(2)` | Opcional | UF do conselho profissional (ex.: `PR`, `SP`) |
+| `endereco_pessoal` | `VARCHAR(200)` | Opcional | Endereço particular do profissional (**interno/sigiloso — nunca exibir no guia**) |
+| `cep_pessoal` | `VARCHAR(8)` | Opcional | CEP particular (**interno/sigiloso**) |
+| `telefone_pessoal1` | `VARCHAR(20)` | Opcional | Telefone/celular pessoal principal (**interno/sigiloso**) |
+| `telefone_pessoal2` | `VARCHAR(20)` | Opcional | Telefone/celular pessoal secundário (**interno/sigiloso**) |
+| `email` | `VARCHAR(150)` | Opcional | E-mail de contato interno do profissional (formato original preservado) |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se o profissional está ativo na base |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:** `UNIQUE (cpf)` (permite múltiplos `NULL`); `UNIQUE (conselho_tipo, conselho_numero, conselho_uf)` quando preenchidos; índice parcial `WHERE ativo = TRUE`; índice trigrama (`GIN gin_trgm_ops`) em `nome`.
+
+---
+
+##### 5. `profissionais_subcategorias`
+* **Para que serve:** Liga um profissional às suas múltiplas especialidades (ex.: um médico que é *Clínico Geral* e *Cardiologista*).
+* **Visibilidade:** Público no Guia.
+* **Relacionamento:** Muitos-para-muitos entre `profissionais` e `subcategorias`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `profissional_id` | `BIGINT` | `NOT NULL REFERENCES profissionais(id) ON DELETE CASCADE` | Profissional vinculado |
+| `subcategoria_id` | `BIGINT` | `NOT NULL REFERENCES subcategorias(id)` | Especialidade do profissional |
+| *Auditoria* | `created_at`, `created_by` | Padrão ligação | Data e usuário que criou o vínculo |
+
+* **Travas e Índices:** `PRIMARY KEY (profissional_id, subcategoria_id)`; **índice invertido** `idx_prof_subcat_subcat_prof ON profissionais_subcategorias (subcategoria_id, profissional_id)` (acelera a busca de todos os profissionais de uma especialidade).
+
+---
+
+##### 6. `convenios`
+* **Para que serve:** Cadastro extensível dos convênios/faixas de atendimento praticados por parceiros e Clínicas Próprias (permite criar **N** convênios/faixas no futuro sem alterar a estrutura do banco).
+* **Visibilidade:** Misto (controlado por `exibir_guia_publico` + Trava CRM do parceiro).
+* **Relacionamento:** 1 Convênio é referenciado por vários itens em `parceiros_precos_beneficios` e `parceiros_precos_historico`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do convênio |
+| `codigo` | `VARCHAR(40)` | `NOT NULL UNIQUE` | Código interno fixo (ex.: `PARTICULAR`, `ASSOCIADO`, `PARCEIRO`, `PREFEITURA`) |
+| `nome` | `VARCHAR(100)` | `NOT NULL UNIQUE` | Nome de exibição na tela e relatórios (ex.: `PRECO ASSOCIADO`, `ENCAMINHAMENTO PREFEITURA`) |
+| `descricao` | `TEXT` | Opcional | Explicação de quando esse convênio/faixa se aplica |
+| `uso_exclusivo_unidade_propria` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Quando `TRUE`, aparece por padrão apenas nas Clínicas Próprias (`UNIDADE_PROPRIA`) |
+| `exibir_guia_publico` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Indica se esta faixa pode aparecer no guia público (sempre respeitando a Trava Dupla CRM do parceiro) |
+| `ordem` | `INTEGER` | `NOT NULL DEFAULT 100` | Ordem de exibição das colunas/linhas na grade de preços (`10, 20, 30...`) |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se o convênio está ativo |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Seed Inicial Obrigatório:** `PARTICULAR` (ordem 10, geral), `ASSOCIADO` (ordem 20, geral), `PARCEIRO` (ordem 30, exclusivo unidade própria), `PREFEITURA` (ordem 40, exclusivo unidade própria).
+* **Travas e Índices:** `UNIQUE (codigo)`, `UNIQUE (nome)`; índice em `(ativo, ordem)`.
+
+---
+
+##### 7. `parceiros`
+* **Para que serve:** Ficha principal do convênio/estabelecimento (Empresa PJ, Profissional Autônomo PF ou Clínica Própria da Associação). Centraliza regras de autorização, travas CRM de privacidade de preços e datas de revisão semestral.
+* **Visibilidade:** Misto (`nome_fantasia`, `exige_autorizacao` e `observacoes_atendimento` são públicos; `observacoes_internas` e controles contratuais são internos).
+* **Relacionamento:** 1 Parceiro possui vários Locais (`parceiros_locais`), Especialidades Gerais (`parceiros_subcategorias`), Profissionais (`parceiros_profissionais`), Contatos (`parceiros_contatos`), Documentos (`parceiros_documentos`), Preços (`parceiros_precos_beneficios`) e Destaques (`parceiros_destaques`).
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do parceiro |
+| `tipo_parceiro` | `tipo_parceiro_enum` | `NOT NULL` | `ESTABELECIMENTO_PJ`, `PROFISSIONAL_PF` ou `UNIDADE_PROPRIA` |
+| `unidade_propria_id` | `BIGINT` | Opcional `REFERENCES unidades(id)` | Obrigatório quando `tipo_parceiro = 'UNIDADE_PROPRIA'` (liga à Matriz/Filial da Associação) |
+| `profissional_titular_id` | `BIGINT` | Opcional `REFERENCES profissionais(id)` | Obrigatório quando `tipo_parceiro = 'PROFISSIONAL_PF'` (liga ao cadastro pessoal do autônomo) |
+| `cpf_cnpj` | `VARCHAR(14)` | Opcional | CPF (11) ou CNPJ (14) validado (somente dígitos) |
+| `razao_social` | `VARCHAR(160)` | Opcional | Razão social da empresa ou nome civil |
+| `nome_fantasia` | `VARCHAR(160)` | `NOT NULL` | Nome de divulgação no guia e no livreto (ex.: `CLINICA VIDA` ou `CONSULTORIO DR. JOAO SILVA`) |
+| `exige_autorizacao` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Indica se o associado precisa retirar guia/autorização prévia antes do atendimento |
+| `observacoes_atendimento` | `TEXT` | Opcional | Orientações públicas ao associado (ex.: *"Apresentar carteirinha e documento com foto"*) |
+| `observacoes_internas` | `TEXT` | Opcional | Anotações sigilosas da equipe da associação (**nunca exibir no guia**) |
+| `bloqueio_divulgacao_valores` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | **Trava CRM (Nível 1):** impede divulgação de preços/descontos no guia público (**somente `ADMINISTRADOR` pode alterar**) |
+| `exibir_valores_guia_publico` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | **Trava CRM (Nível 2):** liga/desliga exibição de preços no guia (só pode ser `TRUE` se `bloqueio_divulgacao_valores = FALSE`) |
+| `lgpd_aceito_em` | `TIMESTAMPTZ` | Opcional | Data/hora em que o parceiro assinou o termo LGPD |
+| `cadastro_atualizado_em` | `TIMESTAMPTZ` | Opcional | Última conferência dos dados cadastrais (gera alerta de revisão a cada 6 meses) |
+| `precos_atualizados_em` | `TIMESTAMPTZ` | Opcional | Última conferência da tabela de preços/descontos (gera alerta a cada 6 meses) |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se o convênio está ativo |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:**
+  * `CHECK (NOT exibir_valores_guia_publico OR NOT bloqueio_divulgacao_valores)` (Trava Dupla CRM);
+  * `CHECK ((tipo_parceiro <> 'UNIDADE_PROPRIA') OR unidade_propria_id IS NOT NULL)`;
+  * `CHECK ((tipo_parceiro <> 'PROFISSIONAL_PF') OR profissional_titular_id IS NOT NULL)`;
+  * Índices: parcial `WHERE ativo = TRUE`, trigrama (`GIN gin_trgm_ops`) em `nome_fantasia`, e índices dedicados em `cadastro_atualizado_em` e `precos_atualizados_em` (alertas semestrais).
+
+---
+
+##### 8. `parceiros_subcategorias`
+* **Para que serve:** Especialidades/ramos **gerais da rede** — valem automaticamente para **todos** os endereços (`parceiros_locais`) daquele parceiro (ideal para redes com várias filiais que oferecem os mesmos serviços).
+* **Visibilidade:** Público no Guia.
+* **Relacionamento:** Muitos-para-muitos entre `parceiros` e `subcategorias`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro dono das especialidades gerais |
+| `subcategoria_id` | `BIGINT` | `NOT NULL REFERENCES subcategorias(id)` | Especialidade válida para todos os endereços do parceiro |
+| *Auditoria* | `created_at`, `created_by` | Padrão ligação | Data e usuário que criou o vínculo |
+
+* **Travas e Índices:** `PRIMARY KEY (parceiro_id, subcategoria_id)`; **índice invertido** `idx_parceiros_subcat_subcat_parceiro ON parceiros_subcategorias (subcategoria_id, parceiro_id)`.
+
+---
+
+##### 9. `parceiros_locais`
+* **Para que serve:** Endereços físicos / filiais públicas onde o parceiro atende, com telefones da recepção, horários, redes sociais autorizadas pela LGPD e coordenadas de mapa.
+* **Visibilidade:** Público no Guia *(redes sociais só são exibidas se a respectiva flag `permite_divulgar_*` for `TRUE`)*.
+* **Relacionamento:** **1 Parceiro possui vários Locais** — cada local aponta para o seu parceiro via `parceiro_id`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do local/filial |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro ao qual este endereço pertence |
+| `nome_local` | `VARCHAR(120)` | Opcional | Nome identificador da unidade/filial (ex.: `FILIAL CENTRO`, `MATRIZ`, `UNIDADE BATEL`) |
+| `endereco` | `VARCHAR(150)` | `NOT NULL` | Logradouro (rua, avenida) |
+| `end_numero` | `VARCHAR(20)` | Opcional | Número do imóvel |
+| `complemento` | `VARCHAR(100)` | Opcional | Sala, andar, bloco, referência |
+| `bairro` | `VARCHAR(100)` | Opcional | Bairro |
+| `cidade` | `VARCHAR(100)` | `NOT NULL` | Cidade de atendimento |
+| `estado` | `CHAR(2)` | `NOT NULL` | UF (2 letras) |
+| `cep` | `VARCHAR(8)` | Opcional | CEP (8 dígitos) |
+| `telefone_publico1` | `VARCHAR(20)` | Opcional | Telefone público principal da recepção |
+| `telefone_publico1_whatsapp` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Indica se o telefone 1 atende WhatsApp |
+| `telefone_publico2` | `VARCHAR(20)` | Opcional | Telefone público secundário |
+| `telefone_publico2_whatsapp` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Indica se o telefone 2 atende WhatsApp |
+| `email_publico` | `VARCHAR(150)` | Opcional | E-mail público para agendamento/contato (formato original) |
+| `instagram` | `VARCHAR(120)` | Opcional | Perfil do Instagram (formato original) |
+| `permite_divulgar_instagram` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Consentimento LGPD (`LGPD.pdf`) para exibir Instagram no guia |
+| `facebook` | `VARCHAR(150)` | Opcional | Página do Facebook (formato original) |
+| `permite_divulgar_facebook` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Consentimento LGPD para exibir Facebook no guia |
+| `whatsapp_divulgacao` | `VARCHAR(20)` | Opcional | Número de WhatsApp específico para divulgação no guia |
+| `permite_divulgar_whatsapp` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Consentimento LGPD para exibir WhatsApp de divulgação no guia |
+| `horario_funcionamento_texto` | `VARCHAR(250)` | Opcional | Horário legível ao público (ex.: `SEG A SEX 08H AS 18H`) |
+| `horario_funcionamento_json` | `JSONB` | Opcional | Horário estruturado para futuro filtro *"Aberto agora"* |
+| `latitude` | `NUMERIC(10, 7)` | Opcional | Latitude para futura busca por proximidade no mapa |
+| `longitude` | `NUMERIC(10, 7)` | Opcional | Longitude para futura busca por proximidade no mapa |
+| `google_maps_url` | `TEXT` | Opcional | Link direto do Google Maps (formato original) |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se a filial está ativa |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:** Índice em `(parceiro_id)`, índice em `(estado, cidade, bairro)`, índice parcial `WHERE ativo = TRUE`, e índice parcial `(latitude, longitude) WHERE latitude IS NOT NULL AND longitude IS NOT NULL`.
+
+---
+
+##### 10. `parceiros_locais_subcategorias`
+* **Para que serve:** Especialidades/ramos **exclusivos de uma filial específica**, permitindo que filiais da mesma empresa atendam especialidades completamente diferentes (ex.: Filial A só *Cardiologia*; Filial B só *Odontologia*).
+* **Visibilidade:** Público no Guia.
+* **Relacionamento:** Muitos-para-muitos entre `parceiros_locais` e `subcategorias`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `local_id` | `BIGINT` | `NOT NULL REFERENCES parceiros_locais(id) ON DELETE CASCADE` | Filial/endereço específico |
+| `subcategoria_id` | `BIGINT` | `NOT NULL REFERENCES subcategorias(id)` | Especialidade oferecida exclusivamente nesta filial |
+| *Auditoria* | `created_at`, `created_by` | Padrão ligação | Data e usuário que criou o vínculo |
+
+* **Travas e Índices:** `PRIMARY KEY (local_id, subcategoria_id)`; **índice invertido** `idx_parceiros_locais_subcat_subcat_local ON parceiros_locais_subcategorias (subcategoria_id, local_id)`.
+
+---
+
+##### 11. `parceiros_profissionais`
+* **Para que serve:** "Lista de escala" **opcional** que liga profissionais aos parceiros (e, opcionalmente, a uma filial específica), permitindo que um profissional atenda em vários estabelecimentos e preservando o histórico quando ele sai (`ativo = FALSE`).
+* **Visibilidade:** Público no Guia *(exibe apenas vínculos com `ativo = TRUE`)*.
+* **Relacionamento:** Muitos-para-muitos entre `parceiros` (+ `parceiros_locais` opcional) e `profissionais`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do vínculo de atendimento |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro/clínica onde o profissional atende |
+| `local_id` | `BIGINT` | Opcional `REFERENCES parceiros_locais(id) ON DELETE CASCADE` | Se `NULL`, atende em **todas** as unidades do parceiro; se preenchido, atende **apenas nesta filial** |
+| `profissional_id` | `BIGINT` | `NOT NULL REFERENCES profissionais(id)` | Profissional vinculado |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | `FALSE` desativa o médico naquela clínica/filial sem apagar histórico |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:**
+  * `UNIQUE NULLS NOT DISTINCT (parceiro_id, local_id, profissional_id)` (evita duplicar o mesmo médico na mesma clínica/filial, inclusive quando `local_id IS NULL`);
+  * Índices: `(parceiro_id, profissional_id) WHERE ativo = TRUE`, `(local_id, profissional_id) WHERE ativo = TRUE AND local_id IS NOT NULL`, e **índice invertido** `idx_parceiros_prof_prof_parceiro ON parceiros_profissionais (profissional_id, parceiro_id) WHERE ativo = TRUE`.
+
+---
+
+##### 12. `parceiros_contatos`
+* **Para que serve:** Contatos **internos/particulares** do parceiro (secretária, gerente, financeiro, comercial), seguindo o mesmo padrão de `clientes_pj_contatos`. Pode valer para toda a rede (`abrange_todos_locais = TRUE`) ou para filiais específicas (`abrange_todos_locais = FALSE` + tabela `13`).
+* **Visibilidade:** **Estritamente Interno / Sigiloso (nunca exibir no guia público)**.
+* **Relacionamento:** Pertence a 1 Parceiro (`parceiro_id -> parceiros(id)`); quando `abrange_todos_locais = FALSE`, liga-se a 1 ou N locais em `parceiros_contatos_locais`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do contato interno |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro ao qual o contato pertence |
+| `abrange_todos_locais` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | `TRUE` = responsável por **todas** as unidades da rede; `FALSE` = responsável apenas pelos locais marcados em `parceiros_contatos_locais` |
+| `nome` | `VARCHAR(120)` | `NOT NULL` | Nome da pessoa de contato |
+| `telefone` | `VARCHAR(20)` | Opcional | Telefone/celular interno do contato |
+| `telefone_whatsapp` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Indica se o telefone atende WhatsApp |
+| `cargo` | `VARCHAR(80)` | Opcional | Cargo (ex.: `GERENTE REGIONAL`, `SECRETARIA`, `PROPRIETARIO`) |
+| `setor` | `VARCHAR(80)` | Opcional | Setor (ex.: `FINANCEIRO`, `RECEPCAO`, `COMERCIAL`) |
+| `email` | `VARCHAR(150)` | Opcional | E-mail interno do contato (formato original) |
+| `observacoes` | `TEXT` | Opcional | Notas sobre horário preferencial de contato, assuntos que resolve, etc. |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se o contato ainda trabalha no parceiro |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:** Índice em `(parceiro_id) WHERE ativo = TRUE`.
+
+---
+
+##### 13. `parceiros_contatos_locais`
+* **Para que serve:** Liga um contato interno específico (`abrange_todos_locais = FALSE`) a **1 ou N filiais** (ex.: secretária de uma unidade ou gerente regional que responde por 3 unidades).
+* **Visibilidade:** **Estritamente Interno / Sigiloso**.
+* **Relacionamento:** Muitos-para-muitos entre `parceiros_contatos` e `parceiros_locais`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `contato_id` | `BIGINT` | `NOT NULL REFERENCES parceiros_contatos(id) ON DELETE CASCADE` | Contato interno |
+| `local_id` | `BIGINT` | `NOT NULL REFERENCES parceiros_locais(id) ON DELETE CASCADE` | Filial sob responsabilidade deste contato |
+| *Auditoria* | `created_at`, `created_by` | Padrão ligação | Data e usuário que criou o vínculo |
+
+* **Travas e Índices:** `PRIMARY KEY (contato_id, local_id)`; índice invertido em `(local_id, contato_id)` para listar rapidamente os contatos internos de uma filial específica.
+
+---
+
+##### 14. `parceiros_documentos`
+* **Para que serve:** Guarda os metadados e chaves de acesso no Storage em nuvem dos anexos do parceiro (contrato, termo LGPD assinado, tabela de preços em PDF, logomarca, banner), seguindo o mesmo padrão de segurança de `documentos_adesao` (item 1.16).
+* **Visibilidade:** Misto (`LOGOMARCA` e `BANNER_PATROCINIO` podem ir ao guia; contratos, termos LGPD e tabelas internas são restritos).
+* **Relacionamento:** Pertence a 1 Parceiro (`parceiro_id -> parceiros(id)`).
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do anexo |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro dono do documento |
+| `tipo_documento_id` | `BIGINT` | `NOT NULL REFERENCES tipos_documento_parceiro(id)` | Tipo do documento cadastrado em `tipos_documento_parceiro` |
+| `nome_arquivo` | `VARCHAR(255)` | `NOT NULL` | Nome original do arquivo enviado |
+| `mime_type` | `VARCHAR(100)` | `NOT NULL` | Tipo validado por assinatura binária (*Magic Bytes*) |
+| `tamanho_bytes` | `BIGINT` | `NOT NULL CHECK (tamanho_bytes > 0)` | Tamanho do arquivo em bytes |
+| `storage_key` | `VARCHAR(500)` | `NOT NULL UNIQUE` | Chave opaca/UUID no Storage externo isolado (nunca `BYTEA` no banco) |
+| `sha256_hash` | `CHAR(64)` | `NOT NULL` | Assinatura de integridade SHA-256 do arquivo |
+| `observacao` | `TEXT` | Opcional | Descrição livre do documento |
+| *Auditoria* | `created_at`, `created_by` | Padrão imutável | Data e usuário do upload |
+
+* **Travas e Índices:** `UNIQUE (storage_key)`; índice em `(parceiro_id, tipo_documento_id)`.
+
+---
+
+##### 15. `tipos_documento_parceiro`
+* **Para que serve:** Cadastro extensível dos tipos de documento que podem ser anexados aos parceiros (substitui o antigo ENUM fixo, permitindo ao Administrador criar novos tipos pela tela sem alterar o banco).
+* **Visibilidade:** Misto (controlado por `permite_guia_publico`).
+* **Relacionamento:** Referenciado por `parceiros_documentos.tipo_documento_id`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do tipo de documento |
+| `codigo` | `VARCHAR(50)` | `NOT NULL UNIQUE` | Código interno único (ex.: `CONTRATO_CREDENCIAMENTO`, `LOGOMARCA`) |
+| `nome` | `VARCHAR(100)` | `NOT NULL UNIQUE` | Nome de exibição na tela (ex.: `CONTRATO DE CREDENCIAMENTO`, `TERMO LGPD ASSINADO`) |
+| `descricao` | `TEXT` | Opcional | Orientação de uso desse tipo de documento |
+| `permite_guia_publico` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | `TRUE` apenas para tipos exibidos no guia público (ex.: `LOGOMARCA`, `BANNER_PATROCINIO`) |
+| `ordem` | `INTEGER` | `NOT NULL DEFAULT 100` | Ordem de exibição nas listas suspensas (`10, 20, 30...`) |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se o tipo está ativo para novos uploads |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Seed Inicial Obrigatório:** `CONTRATO_CREDENCIAMENTO` (`permite_guia_publico = FALSE`), `TERMO_LGPD_ASSINADO` (`FALSE`), `TABELA_PRECOS_PDF` (`FALSE`), `LOGOMARCA` (`TRUE`), `BANNER_PATROCINIO` (`TRUE`), `OUTRO` (`FALSE`).
+* **Travas e Índices:** `UNIQUE (codigo)`, `UNIQUE (nome)`; índice em `(ativo, ordem)`.
+
+---
+
+##### 16. `parceiros_precos_beneficios`
+* **Para que serve:** Caderno de preços e descontos do parceiro, estruturado por **Convênio (`convenio_id`)** — suportando tanto 2 faixas padrão para credenciados (*Particular* e *Associado*) quanto **N convênios** para Clínicas Próprias (*Particular*, *Associado*, *Parceiro*, *Prefeitura*, etc.). Permite preço geral para toda a rede (`local_id IS NULL`) ou preço específico por unidade (`local_id` preenchido), podendo variar também por médico ou procedimento.
+* **Visibilidade:** Controlado pela **Trava Dupla CRM** de `parceiros` + flag `exibir_guia_publico` de `convenios`.
+* **Relacionamento:** Pertence a 1 Parceiro (`parceiro_id`) e a 1 Convênio (`convenio_id`), com vínculos opcionais a `parceiros_locais`, `profissionais`, `subcategorias` e `catalogo_procedimentos`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único da regra de preço/desconto |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro dono do caderno de preços |
+| `convenio_id` | `BIGINT` | `NOT NULL REFERENCES convenios(id)` | Qual convênio/faixa este valor representa (*Particular*, *Associado*, *Parceiro*, *Prefeitura*, etc.) |
+| `local_id` | `BIGINT` | Opcional `REFERENCES parceiros_locais(id) ON DELETE CASCADE` | **Escada Anti-Empate:** se `NULL`, vale para **todas as unidades** da rede (Degrau 1 — exige `profissional_id IS NULL`); se preenchido, vale **apenas para esta unidade** (Degrau 2 ou Degrau 3) |
+| `profissional_id` | `BIGINT` | Opcional `REFERENCES profissionais(id)` | Permite diferenciar preço/desconto por profissional **dentro de um local específico** (Degrau 3 — exige `local_id IS NOT NULL` e vínculo ativo em `parceiros_profissionais`) |
+| `subcategoria_id` | `BIGINT` | Opcional `REFERENCES subcategorias(id)` | Especialidade/ramo ao qual o benefício se aplica (filtrado no funil pelas especialidades ativas daquele parceiro/local) |
+| `procedimento_id` | `BIGINT` | Opcional `REFERENCES catalogo_procedimentos(id)` | Procedimento/exame do catálogo (ex.: `CONSULTA` combinado com `subcategoria_id`, ou exame específico como `ECOCARDIOGRAMA`) |
+| `tipo_precificacao` | `tipo_precificacao_enum` | `NOT NULL` | `VALOR_FIXO`, `PERCENTUAL_DESCONTO` ou `SOB_CONSULTA` |
+| `valor` | `NUMERIC(12, 2)` | Opcional (`CHECK >= 0`) | Valor em reais (usado quando `tipo_precificacao = 'VALOR_FIXO'`) |
+| `percentual_desconto` | `NUMERIC(5, 2)` | Opcional (`CHECK > 0 AND <= 100`) | Percentual de desconto (usado quando `tipo_precificacao = 'PERCENTUAL_DESCONTO'`) |
+| `descricao_beneficio` | `VARCHAR(255)` | Opcional | Texto livre quando não há procedimento no catálogo (ex.: *"20% EM MEDICAMENTOS GENERICOS"*) |
+| `regras_pagamento` | `VARCHAR(255)` | Opcional | Condições comerciais (ex.: *"SOMENTE NO PIX OU DINHEIRO"*, *"ATE 3X NO CARTAO"*) |
+| `observacoes` | `TEXT` | Opcional | Observações complementares |
+| `vigencia_inicio` | `DATE` | Opcional | Data a partir da qual o preço/desconto passou a valer |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Indica se o item de preço está vigente |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:**
+  * **Consistência de Preço:** `CHECK ((tipo_precificacao = 'VALOR_FIXO' AND valor IS NOT NULL AND percentual_desconto IS NULL) OR (tipo_precificacao = 'PERCENTUAL_DESCONTO' AND percentual_desconto IS NOT NULL AND valor IS NULL) OR (tipo_precificacao = 'SOB_CONSULTA' AND valor IS NULL AND percentual_desconto IS NULL))`;
+  * **Trava Anti-Empate (Profissional sempre exige Local):** `CHECK (profissional_id IS NULL OR local_id IS NOT NULL)` — elimina matematicamente qualquer empate entre "preço do profissional sem local" e "preço da filial sem profissional";
+  * **Trava Anti-Linha Vazia ("Muda"):** `CHECK (procedimento_id IS NOT NULL OR subcategoria_id IS NOT NULL OR NULLIF(TRIM(descricao_beneficio), '') IS NOT NULL)` — impede cadastrar valor/desconto sem informar a que item/serviço se refere;
+  * **Trava Anti-Duplicidade Ativa (PostgreSQL 15+):** `CREATE UNIQUE INDEX uq_parceiros_precos_ativo ON parceiros_precos_beneficios (parceiro_id, convenio_id, local_id, profissional_id, subcategoria_id, procedimento_id, COALESCE(NULLIF(TRIM(descricao_beneficio), ''), '')) NULLS NOT DISTINCT WHERE ativo = TRUE` — impede fisicamente duas regras ativas duplicadas para a mesma combinação;
+  * **Validação no Backend (Funil):** Se `local_id` preenchido, confirmar que pertence ao `parceiro_id`; se `profissional_id` preenchido, confirmar vínculo ativo em `parceiros_profissionais` para aquele `parceiro_id` e `local_id` (ou vínculo geral de rede do profissional); se `subcategoria_id` preenchida, confirmar que pertence ao conjunto de especialidades ativas do parceiro/local;
+  * Índices: `(parceiro_id, convenio_id) WHERE ativo = TRUE`, `(local_id, convenio_id) WHERE ativo = TRUE AND local_id IS NOT NULL`, `(procedimento_id) WHERE ativo = TRUE AND procedimento_id IS NOT NULL`, `(profissional_id) WHERE ativo = TRUE AND profissional_id IS NOT NULL`.
+
+---
+
+##### 17. `parceiros_precos_historico`
+* **Para que serve:** Registro automático e imutável de todos os reajustes de preço ou desconto (além do log técnico em `auditoria_eventos`), facilitando auditoria comercial e histórico de negociações.
+* **Visibilidade:** **Estritamente Interno**.
+* **Relacionamento:** Vinculado ao item alterado (`preco_beneficio_id`), ao parceiro (`parceiro_id`) e ao convênio (`convenio_id`).
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do registro de histórico |
+| `preco_beneficio_id` | `BIGINT` | `NOT NULL REFERENCES parceiros_precos_beneficios(id) ON DELETE CASCADE` | Item de preço que sofreu reajuste |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro correspondente (atalho para relatórios de histórico) |
+| `convenio_id` | `BIGINT` | `NOT NULL REFERENCES convenios(id)` | Convênio/faixa afetado (*Particular*, *Associado*, *Prefeitura*, etc.) |
+| `tipo_precificacao_anterior` | `tipo_precificacao_enum` | `NOT NULL` | Tipo anterior do preço |
+| `tipo_precificacao_novo` | `tipo_precificacao_enum` | `NOT NULL` | Novo tipo do preço |
+| `valor_anterior` | `NUMERIC(12, 2)` | Opcional | Valor monetário anterior |
+| `valor_novo` | `NUMERIC(12, 2)` | Opcional | Novo valor monetário |
+| `percentual_anterior` | `NUMERIC(5, 2)` | Opcional | Percentual de desconto anterior |
+| `percentual_novo` | `NUMERIC(5, 2)` | Opcional | Novo percentual de desconto |
+| `motivo` | `TEXT` | Opcional | Justificativa do reajuste (ex.: *"REAJUSTE ANUAL 2026"*) |
+| `alterado_em` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Data/hora exata da alteração |
+| `alterado_por_usuario_id` | `BIGINT` | `NOT NULL REFERENCES usuarios(id)` | Usuário responsável pela alteração |
+
+* **Travas e Índices:** Índice em `(preco_beneficio_id, alterado_em DESC)` e `(parceiro_id, alterado_em DESC)`.
+
+---
+
+##### 18. `parceiros_planos_elegiveis` *(Preparada para o Futuro)*
+* **Para que serve:** Permite restringir no futuro um parceiro ou um benefício específico apenas a associados que pagam determinados **planos da associação** (`planos`, ex.: *Básico*, *Bronze*, *Plus*) ou **benefícios adicionais** (`beneficios_adicionais`, ex.: *Cuidado Pet*, *Seguro Funeral*). **Quando não houver registros para um parceiro/benefício, qualquer associado de qualquer plano/unidade tem direito.**
+  * **Atenção — Não confundir com `convenios` (obrigatório documentar no SQL via `COMMENT ON` e comentário inline):** `convenios` define a **faixa de preço no atendimento** (`PARTICULAR`, `ASSOCIADO`, `PARCEIRO`, `PREFEITURA`), usada em `parceiros_precos_beneficios`; já `planos` define o **pacote mensal contratado pelo associado no carnê**. Esta tabela (`parceiros_planos_elegiveis`) controla **quem tem acesso** (ex.: clínica veterinária liberada apenas para quem tem *Plano Plus* ou adicional *Cuidado Pet*).
+* **Visibilidade:** Interno / Regra de filtro do Guia.
+* **Relacionamento:** Liga `parceiros` (e opcionalmente `parceiros_precos_beneficios`) a `planos` e/ou `beneficios_adicionais`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único da regra de elegibilidade |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro restrito |
+| `preco_beneficio_id` | `BIGINT` | Opcional `REFERENCES parceiros_precos_beneficios(id) ON DELETE CASCADE` | Se `NULL`, aplica-se ao parceiro todo; se preenchido, apenas àquele benefício |
+| `plano_id` | `BIGINT` | Opcional `REFERENCES planos(id)` | Plano mensal do associado na Associação (ex.: Básico, Plus — **não** é faixa de `convenios`) |
+| `beneficio_adicional_id` | `BIGINT` | Opcional `REFERENCES beneficios_adicionais(id)` | Benefício adicional contratado pelo associado/dependente (ex.: Cuidado Pet, Seguro Funeral) |
+| *Auditoria* | `created_at`, `created_by` | Padrão ligação | Data e usuário que configurou a regra |
+
+* **Travas e Índices:** `CHECK (plano_id IS NOT NULL OR beneficio_adicional_id IS NOT NULL)`; índice em `(parceiro_id)` e `(preco_beneficio_id) WHERE preco_beneficio_id IS NOT NULL`.
+* **Orientação Obrigatória para o Novo SQL (`02_schema_postgresql_moderno.sql`):** Inserir `COMMENT ON TABLE parceiros_planos_elegiveis`, `COMMENT ON COLUMN parceiros_planos_elegiveis.plano_id` e comentário inline explicando explicitamente a diferença entre `planos` (pacote mensal pago pelo associado) e `convenios` (faixa de preço praticada no atendimento).
+
+---
+
+##### 19. `parceiros_destaques`
+* **Para que serve:** Gerencia parceiros, filiais, profissionais ou ofertas em destaque (editorial interno ou patrocinado) no guia online/app, com controle de vigência, escopo geográfico/categoria e ordem de exibição.
+* **Visibilidade:** Público no Guia *(apenas registros ativos dentro de `data_inicio`..`data_fim`)*.
+* **Relacionamento:** Liga-se a `parceiros` (obrigatório) e opcionalmente a `parceiros_locais`, `profissionais`, `parceiros_precos_beneficios` e `subcategorias`.
+
+| Coluna | Tipo PostgreSQL | Obrigatório / Padrão | Significado / Comentário SQL |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | `PRIMARY KEY` | Identificador único do destaque |
+| `tipo_destaque` | `tipo_destaque_parceiro_enum` | `NOT NULL` | `EDITORIAL_INTERNO` ou `PATROCINADO` |
+| `parceiro_id` | `BIGINT` | `NOT NULL REFERENCES parceiros(id) ON DELETE CASCADE` | Parceiro destacado |
+| `local_id` | `BIGINT` | Opcional `REFERENCES parceiros_locais(id) ON DELETE CASCADE` | Se preenchido, destaca especificamente aquela filial da rede |
+| `profissional_id` | `BIGINT` | Opcional `REFERENCES profissionais(id)` | Opcional para destacar um médico específico |
+| `preco_beneficio_id` | `BIGINT` | Opcional `REFERENCES parceiros_precos_beneficios(id) ON DELETE SET NULL` | Opcional para vincular uma oferta específica (respeitando Trava CRM) |
+| `subcategoria_id` | `BIGINT` | Opcional `REFERENCES subcategorias(id)` | Especialidade/ramo onde o destaque aparece (obrigatório nos escopos `CATEGORIA` e `CIDADE_CATEGORIA`) |
+| `escopo` | `escopo_destaque_parceiro_enum` | `NOT NULL` | Onde o destaque aparece: `GERAL`, `CIDADE`, `CATEGORIA` ou `CIDADE_CATEGORIA` |
+| `cidade` | `VARCHAR(100)` | Opcional | Cidade-alvo (obrigatória nos escopos `CIDADE` e `CIDADE_CATEGORIA`) |
+| `estado` | `CHAR(2)` | Opcional | UF-alvo (obrigatória quando `cidade` informada) |
+| `nivel_patrocinio` | `INTEGER` | `NOT NULL DEFAULT 0` | Peso/nível do patrocínio (quanto maior, maior prioridade na vitrine) |
+| `texto_promocional` | `VARCHAR(255)` | Opcional | Chamada curta exibida no card de destaque |
+| `banner_storage_key` | `VARCHAR(500)` | Opcional | Chave no Storage da imagem do banner |
+| `ordem` | `INTEGER` | `NOT NULL DEFAULT 100` | Posição numérica de exibição para desempate dentro do mesmo escopo (`10, 20, 30...`) |
+| `data_inicio` | `DATE` | `NOT NULL` | Início da vigência do destaque |
+| `data_fim` | `DATE` | Opcional | Fim da vigência (`NULL` = sem data de término; se preenchido, `CHECK (data_fim >= data_inicio)`) |
+| `ativo` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Permite pausar o destaque manualmente antes do fim da vigência |
+| *Auditoria* | `created_at`, `updated_at`, `created_by`, `updated_by` | Padrão do módulo | Rastreabilidade |
+
+* **Travas e Índices:** `CHECK (data_fim IS NULL OR data_fim >= data_inicio)`; índice em `(ativo, escopo, estado, cidade, subcategoria_id, nivel_patrocinio DESC, ordem ASC)` para montagem instantânea da vitrine do guia.
+
+---
+
+#### 1.25.4 Regras de Negócio Consolidadas do Módulo
+
+1. **Múltiplas Especialidades e Independência:** Tanto a rede (`parceiros_subcategorias`), cada filial (`parceiros_locais_subcategorias`) quanto os profissionais (`profissionais_subcategorias`) podem possuir **múltiplas especialidades**, de forma independente (as especialidades da clínica ou filial **não restringem** as dos profissionais vinculados a ela).
+2. **Regra da União (`UNION`) por Filial na Pesquisa, Guia e Livreto:** Toda busca por especialidade/ramo (no sistema, no guia online e na geração do livreto) deve avaliar cada filial ativa (`parceiros_locais`) retornando a **união sem duplicatas** entre:
+   * **(a)** especialidades gerais do parceiro (`parceiros_subcategorias`);
+   * **(b)** especialidades exclusivas daquela filial (`parceiros_locais_subcategorias`);
+   * **(c)** especialidades dos profissionais ativos (`profissionais.ativo = TRUE`) vinculados de forma ativa (`parceiros_profissionais.ativo = TRUE`) àquela filial específica **ou** ao parceiro com `local_id IS NULL`.
+   * *Resultado garantido:* uma filial que só oferece *Odontologia* nunca aparece numa busca de *Cardiologia*, mesmo que outra filial da mesma empresa ofereça *Cardiologia*.
+3. **Escada Anti-Empate de 3 Degraus, Zero Duplicidade e Procedimentos Genéricos (`parceiros_precos_beneficios`):**
+   * **Zero Empates (`CHECK (profissional_id IS NULL OR local_id IS NOT NULL)`):** É proibido cadastrar preço de profissional sem informar o `local_id`. A resolução de preço para um dado `convenio_id` segue uma hierarquia estrita em 3 degraus sem sobreposição lateral:
+     1. **Degrau 3 (Mais específico — prevalece sempre):** `local_id` preenchido + `profissional_id` preenchido (exceção do profissional naquela filial);
+     2. **Degrau 2:** `local_id` preenchido + `profissional_id IS NULL` (padrão da filial);
+     3. **Degrau 1 (Mais genérico):** `local_id IS NULL` + `profissional_id IS NULL` (padrão geral da rede).
+   * **Zero Duplicidade e Zero Linha Vazia:** Índice único parcial (`NULLS NOT DISTINCT WHERE ativo = TRUE`) bloqueia regras ativas duplicadas, e `CHECK` exige ao menos `procedimento_id`, `subcategoria_id` ou `descricao_beneficio`.
+   * **Reuso de Procedimentos Genéricos:** Não exigir lista prévia de procedimentos por filial nem criar procedimentos duplicados por especialidade (ex.: manter um único `CONSULTA` em `catalogo_procedimentos` combinado com `subcategoria_id` no funil de preços).
+4. **Trava Dupla CRM (Privacidade de Preços):** Nenhum preço ou desconto aparece no guia público a menos que: `parceiros.bloqueio_divulgacao_valores = FALSE` (alterável apenas por `ADMINISTRADOR`) **E** `parceiros.exibir_valores_guia_publico = TRUE` **E** `convenios.exibir_guia_publico = TRUE`.
+5. **Revisão Semestral:** Painel/alerta automático sinaliza parceiros ativos cujas datas `cadastro_atualizado_em` ou `precos_atualizados_em` estejam nulas ou com mais de 6 meses. Cada data é atualizada **automaticamente** quando há alteração na respectiva área (cadastro/locais/contatos $\to$ `cadastro_atualizado_em`; preços/benefícios/PDF de tabela $\to$ `precos_atualizados_em`) e também **manualmente** via botão **"Confirmar como Conferido Hoje"** na ficha do parceiro (quando na conferência semestral não houve alteração).
+6. **Segurança de Anexos:** `parceiros_documentos` e banners seguem integralmente a regra de validação de assinatura binária (*Magic Bytes*), Storage isolado sem execução e `sha256_hash` definida no item **1.16**.
+
+---
+
+#### 1.25.5 Regras de Tela e Experiência de Uso (UX)
+
+* **Ficha Única (Mestre-Detalhe) com Botões `+`:** Todo o cadastro do parceiro acontece em uma **única tela** organizada em blocos logo abaixo dos dados principais, com botões **`+`** para adicionar especialidades, endereços (1º endereço já aberto), profissionais, contatos internos, preços/benefícios e documentos — sem obrigar o operador a navegar entre várias telas.
+* **Cadastro Unificado para Profissional Autônomo (`PROFISSIONAL_PF`):** Ao escolher *"Profissional Autônomo (Consultório Próprio)"*, a mesma tela exibe o bloco de dados pessoais internos do profissional (ou permite selecionar um profissional já cadastrado) integrado aos dados públicos do consultório; ao salvar, o sistema grava e vincula `profissionais` + `parceiros` + `parceiros_locais` automaticamente.
+* **Clareza de Alcance nas Especialidades:**
+  * Bloco superior: **"Especialidades da Rede (valem para TODOS os endereços)"** — botão **`+ Adicionar para todos os endereços`**, com texto de apoio orientando a deixar vazio quando as filiais atendem especialidades diferentes.
+  * Dentro de cada card de endereço: **"Especialidades exclusivas deste endereço"** — botão **`+ Adicionar só neste endereço`** (exibindo como lembrete visual eventuais especialidades herdadas da rede).
+* **Clareza de Alcance nos Contatos Internos:** Ao clicar em `+ Adicionar contato interno`, o operador escolhe entre `(•) Responsável por todos os endereços` (`abrange_todos_locais = TRUE`) ou `( ) Responsável apenas por endereços específicos` (`abrange_todos_locais = FALSE`, abrindo caixas de seleção para marcar 1 ou N filiais).
+* **Fluxo em Funil de Precificação (6 Passos — Zero Erros e Zero Empates):** Ao adicionar preços em `parceiros_precos_beneficios`, os seletores pesquisáveis (comboboxes) filtram em cascata no backend e na UI:
+  1. **Parceiro** *(já selecionado na ficha)*;
+  2. **Local (`local_id`):** *"Todos os Locais (Padrão da Rede)"* (`NULL`) ou uma filial específica daquele parceiro *(se o parceiro possuir apenas 1 local, pré-selecionar automaticamente)*;
+  3. **Especialidade / Ramo (`subcategoria_id`, opcional):** lista apenas as especialidades ativas daquele parceiro/local (ou vazio para desconto geral da loja);
+  4. **Profissional (`profissional_id`, opcional):** **habilitado somente quando um Local foi escolhido no Passo 2**, listando apenas profissionais ativos naquele local e especialidade *(com botão de conveniência **"Aplicar para todas as filiais onde este profissional atende"**, que grava 1 linha por filial onde o profissional atua sem gerar empates)*;
+  5. **Procedimento (`procedimento_id`) ou Descrição Livre (`descricao_beneficio`):** caixa pesquisável do catálogo geral (reaproveitando itens genéricos como `CONSULTA` combinados à especialidade do Passo 3) ou descrição livre (ex.: farmácias/comércios);
+  6. **Grade de Convênios e Preços (`convenio_id`):** na ficha de parceiros credenciados, exibe lado a lado as colunas padrão (**Particular** e **Associado**) para digitação rápida; nas Clínicas Próprias (`UNIDADE_PROPRIA`), exibe todos os convênios ativos (**Particular**, **Associado**, **Parceiro**, **Prefeitura** e futuros).
 
 ---
 
@@ -361,3 +885,5 @@
    * Se qualquer alteração proposta entrar em conflito com outra tabela, regra financeira, layout bancário, tela ou relatório, **não improvisar nem aplicar silenciosamente**: parar antes da edição, explicar o contexto completo do conflito, orientar com as alternativas e fazer perguntas objetivas ao usuário até fechar uma decisão definitiva.
 4. **Conferência Global Pós-Edição:**
    * Ao concluir as atualizações, revisar o `02_schema_postgresql_moderno.sql` de ponta a ponta (tipos, FKs, `DEFAULT`s, `CHECK`s, índices, `SEQUENCE`s e auditoria `created_by`/`updated_by`) e confirmar alinhamento integral com `03`, `04`, `05`, `06`, `07` e `08`.
+5. **Documentação Obrigatória de Campos Não Óbvios no `.sql` (`COMMENT ON` e Comentários Inline):**
+   * Ao refatorar/gerar o `02_schema_postgresql_moderno.sql`, todo campo, flag, enum ou regra cujo significado ou uso prático não seja imediatamente óbvio pelo nome (ex.: `ordem` em `categorias` e `parceiros_destaques`, `exige_autorizacao`, `bloqueio_divulgacao_valores`, `exibir_valores_guia_publico`, `nivel_patrocinio`, códigos herdados, e a **distinção entre `planos` [pacote mensal do associado em `parceiros_planos_elegiveis`] vs. `convenios` [faixa de preço no atendimento em `parceiros_precos_beneficios`]**, etc.) **deve** receber comentários claros no próprio `.sql` — usando **comentários inline (`-- ...`)** junto à definição da coluna **e/ou** comandos **`COMMENT ON COLUMN` / `COMMENT ON TABLE`** do PostgreSQL, explicando em linguagem direta o que o campo representa e como deve ser usado.
