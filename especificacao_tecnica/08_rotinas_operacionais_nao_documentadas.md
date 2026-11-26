@@ -259,7 +259,7 @@
   2. O atendente escolhe entre duas opções na tela:
      * **Abatimento distribuído nas parcelas futuras (Padrão Ideal):** Aplica `valor_abatimento` igual ao valor do dependente em cada parcela futura em aberto (e proporcionalmente na `'UNICA'`, se ainda em aberto, aplicando o desconto de 20% sobre o valor mensal abatido).
      * **Abatimento concentrado na próxima parcela:** Soma o total a abater em uma única parcela (a próxima em aberto), mantendo as demais no valor cheio.
-  3. **Envio Automático ao Sicoob (CNAB 240 — Movimento `'04'`):** Para todas as parcelas afetadas que já estavam registradas no banco (`registrado = 'S'`), o sistema marca-as para envio na próxima remessa CNAB 240 com **Código de Movimento `'04'` (Concessão de Abatimento)** e preenchendo o campo `Valor do Abatimento` (posições `181..195` do Segmento `P`), permitindo que o associado pague com o valor corrigido diretamente no banco/lotérica/Pix usando o boleto original, reimpresso ou enviado por WhatsApp.
+  3. **Envio Automático ao Sicoob (CNAB 240 — Movimento `'04'`):** Para todas as parcelas afetadas que já estavam registradas no banco (`registrado = 'S'`), o sistema marca-as para envio na próxima remessa CNAB 240 com **Código de Movimento `'04'` (Concessão de Abatimento)** — gerando o par obrigatório **`P` + `Q` ambos com código `'04'`** (sem Segmento `R`, conforme regra validada no Validador Sicoob em `04_regras_negocio_financeiro_cnab_arquivos.md`) e preenchendo o campo `Valor do Abatimento` (posições `181..195` do Segmento `P`), permitindo que o associado pague com o valor corrigido diretamente no banco/lotérica/Pix usando o boleto original, reimpresso ou enviado por WhatsApp.
 
 ---
 

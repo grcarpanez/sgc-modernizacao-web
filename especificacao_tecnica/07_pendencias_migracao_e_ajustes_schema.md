@@ -88,16 +88,21 @@
 
 ---
 
-### 1.5 Identificação Única no Sicoob CNAB 240 (`Nosso Número`, `Nº do Documento` e `Uso da Empresa`)
-* **Verificação no Layout Oficial Sicoob (`Layouts_para_troca_de_informações - cooperativas.xls`):**
-  1. **`Nosso Número` (Seg. `P` `38..57` / Retorno `T` `38..57`):** Os `10` primeiros bytes são o `NumTitulo` (`7 dígitos` sequenciais via `seq_nosso_numero_sicoob` + `1` DV Módulo 11 `3197`, preenchidos com zeros à esquerda). Como é um sequencial único global por parcela, **não se repete** entre carnês e não deve ser alterado com `num_carne`/`anomes`.
-  2. **`Nº do Documento` ("Seu Número", Seg. `P` `63..77` / Retorno `T` `59..73`):** Suporta **15 caracteres** (usar **somente dígitos numéricos** por segurança e compatibilidade entre qualquer banco). Regra explícita: **`num_adesao + anomes(4) + tipo(1 dígito)`** (ex.: `1950026101`, cabendo até 10 dígitos de `num_adesao`), onde o dígito final identificador do tipo é:
+### 1.5 Identificação Única no Sicoob CNAB 240 (`Nosso Número`, `Nº do Documento`, `Uso da Empresa` e `Informação 3/4`)
+* **Verificação no Layout Oficial Sicoob (`Layouts_para_troca_de_informações - cooperativas.xls`, aba `03.Remessa - Opção CNAB240`) e no Boleto Real (`Modelo Boleto.pdf`):**
+  1. **`Nosso Número` (Impresso no boleto | Seg. `P` `38..57` / Retorno `T` `38..57`):** Os `10` primeiros bytes são o `NumTitulo` (`7 dígitos` sequenciais via `seq_nosso_numero_sicoob` + `1` DV Módulo 11 `3197`, preenchidos com zeros à esquerda). É **único globalmente por parcela** — nunca se repete entre carnês e é a chave principal de conciliação.
+  2. **`Nº do Documento` ("Seu Número" — Impresso no boleto | Seg. `P` `63..77` / Retorno `T` `59..73`):** Suporta **15 caracteres** (usar **somente dígitos numéricos**). Mantém visível no boleto e no carnê a identificação **`num_adesao + anomes(4) + tipo(1 dígito)`** (ex.: adesão `19500`, competência `2610`, carnê regular `1` $\to$ `1950026101`), preservando a leitura imediata da adesão e da competência (`anomes`) e evitando confusão entre mensalidade e acordo na mesma competência:
      * `1` = Carnê Regular PF / Boleto Mensal PJ (`CARNE_PF`, `BOLETO_PJ`)
      * `2` = Taxa de Adesão Inicial (`ADESAO`)
      * `3` = Taxa de Reativação (`REATIVACAO`)
      * `4` = Renegociação / Acordo / Consolidação (`RENEGOCIACAO`, `DEBIT`)
-  3. **`Uso Empresa Beneficiário` ("Identificação do Título na Empresa", Seg. `P` `196..220` / Retorno `T` `106..130`):** Suporta **25 caracteres**, devolvidos integralmente pelo Sicoob no retorno!
-* **Diretriz:** Manter `Nosso Número` sequencial único por parcela (sempre único no banco); usar o campo **`Uso da Empresa` (25 posições)** para gravar a chave composta numérica completa (`PadLeftZero(num_carne, 8) + PadLeftZero(num_adesao, 8) + anomes(4)` = 20 dígitos), garantindo conciliação 100% inequívoca no retorno mesmo entre múltiplos carnês e entre mensalidade + acordo no mesmo mês.
+  3. **`Uso Empresa Beneficiário` (Invisível no papel do boleto | Seg. `P` `196..220` / Retorno `T` `106..130`):** Suporta **25 caracteres**, não é impresso para o pagador e é devolvido integralmente pelo Sicoob no arquivo de retorno.
+  4. **Mensagem / Observação Impressa no Boleto (Seg. `R`, campos `18.3R Informação 3` [`100..139`, 40 chars] e `19.3R Informação 4` [`140..179`, 40 chars]):** Texto impresso no quadro *"Termo de Responsabilidade do Beneficiário"* do boleto Sicoob (e também nos PDFs próprios de carnê). O sistema **deve preencher automaticamente** esses campos em `Mov = '01'` (já em **MAIÚSCULAS, sem acentos e sem caracteres especiais**, ex.: `"MENSALIDADE 10 2026 CARNE REGULAR"`, `"ACORDO 02 DE 04 REF 10 2026"`, `"TAXA DE REATIVACAO ADESAO 19500"`), dando total clareza ao associado. *(Na Solicitação de Baixa `Mov = '02'` e Abatimento `'04'`/`'05'`, o Segmento `R` é omitido, enviando apenas o par `P` + `Q` com o mesmo código de movimento — ver `04_regras_negocio_financeiro_cnab_arquivos.md` Seção 3.3.)*
+* **Diretriz Unificada (Papel + Banco/CNAB):**
+  * **`Nosso Número`** identifica unicamente cada título no banco;
+  * **`Nº do Documento`** garante a leitura humana clara de **`num_adesao + anomes + tipo`** no boleto/carnê impresso (atendendo ao item **1.2**);
+  * **`Informação 3 e 4` (Segmento `R`)** explicam em texto legível no boleto o que é a parcela, sua competência e tipo;
+  * **`Uso da Empresa` (25 posições)** grava a chave composta completa **`PadLeftZero(num_carne, 8) + PadLeftZero(num_adesao, 8) + anomes(4)`** (20 dígitos), garantindo conciliação 100% inequívoca no retorno bancário mesmo entre múltiplos carnês do mesmo associado no mesmo ano ou entre mensalidade e acordo no mesmo mês.
 
 ---
 
@@ -337,6 +342,22 @@
 * **Código de Barras, Linha Digitável e Boleto Híbrido Pix (`parcelas`):**
   * Armazenar **`codigo_barras VARCHAR(44)`** e **`linha_digitavel VARCHAR(47)`** na tabela `parcelas` (calculados pelo sistema conforme regra oficial Sicoob no modo CNAB 240, ou gravados diretamente do retorno da API v3 no futuro), garantindo reprodutibilidade exata em reimpressões/2ª via;
   * Prever colunas opcionais futuras **`pix_copia_cola TEXT`** e **`txid_pix VARCHAR(60)`** em `parcelas` para armazenar o QR Code Pix retornado pela API v3 do Sicoob e imprimi-lo diretamente nas lâminas dos carnês/boletos em PDF.
+* **Blindagem do Status de Registro Bancário CNAB (`status_registro_cnab_enum` — Correção do Bug Legado `S`/`B` $\to$ `N`):**
+  * **Causa Raiz Comprovada no Legado (`SGCeFeGe.exe` @ `0x58eeac`):** O único local que gravava `'N'` era o processamento de retorno Sicoob código `'03'` (*Rejeição*), que sobrescrevia `REGISTRADO = 'N'` cegamente sem ler `Motivo da Ocorrência` (`pos 214..223`) nem proteger estados anteriores (rebaixando títulos `'S'` ou `'B'` para `'N'`, inclusive boletos já pagos no banco ou retornados com `'A5'` *"título baixado, liquidado ou quitado"*), além de o código `'06'` (*Liquidação*) deixar títulos pagos no banco presos como `'S'`.
+  * **Ação no Schema (`status_registro_cnab_enum`):** Ampliar o enum (hoje `('N', 'S', 'B')`) para **5 estados explícitos**:
+    1. **`NAO_REGISTRADO`** (nunca enviado ao banco);
+    2. **`REGISTRADO`** (entrada confirmada `'02'` e ativo no banco);
+    3. **`BAIXADO`** (retirado do banco por `'09'` ou retorno `'A5'` em parcela paga em carteira/cancelada);
+    4. **`LIQUIDADO_BANCO`** (pago diretamente na rede bancária via `'06'`, ou `'A5'` em parcela já paga no banco);
+    5. **`REJEITADO`** (recusado na 1ª tentativa de registro `'01'` — acompanha as novas colunas opcionais **`codigo_rejeicao_cnab VARCHAR(20)`** e **`motivo_rejeicao_cnab TEXT`** para exibição e correção).
+  * **Regra de Transição ("Caminho Sem Volta" no Backend):** Títulos em `REGISTRADO`, `BAIXADO` ou `LIQUIDADO_BANCO` **jamais** podem voltar para `NAO_REGISTRADO` em retornos `'03'`, `'26'` ou `'30'` (interpretar obrigatoriamente `pos 214..223` conforme regra completa em `04_regras_negocio_financeiro_cnab_arquivos.md` Seção 3.4.A). Travar Remessa `'01'` apenas para `ABERTA` + (`NAO_REGISTRADO` | `REJEITADO`) e Remessa `'02'` apenas para `REGISTRADO`.
+  * **Saneamento Automático na Migração (`ABAC.FDB` $\to$ PostgreSQL):** Corrigir na carga os registros históricos rebaixados pelo bug legado:
+    * `REGISTRADO = 'B'` $\to$ `'BAIXADO'`;
+    * `REGISTRADO = 'S'` com `DTPAG IS NOT NULL AND COALESCE(VALOR_COMP, 0) > 0` $\to$ `'LIQUIDADO_BANCO'`; demais `'S'` $\to$ `'REGISTRADO'`;
+    * `REGISTRADO = 'N'` com `DTPAG IS NOT NULL AND COALESCE(VALOR_COMP, 0) > 0` *(~3.597 títulos históricos pagos no banco rebaixados por `'03'`)* $\to$ `'LIQUIDADO_BANCO'`;
+    * `REGISTRADO = 'N'` com `DTPAG IS NOT NULL AND COALESCE(VALOR_COMP, 0) = 0` *(ex.: títulos `'A5'` já baixados no banco)* $\to$ `'BAIXADO'`;
+    * `REGISTRADO = 'N'` com `DTPAG IS NULL` *(rejeitados em aberto)* $\to$ `'REJEITADO'`;
+    * `REGISTRADO IS NULL` $\to$ `'NAO_REGISTRADO'`.
 
 ---
 

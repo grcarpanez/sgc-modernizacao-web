@@ -20,12 +20,13 @@ Qualquer agente de IA que implemente este sistema **DEVE** obedecer rigorosament
 7. **Precisão Posicional dos Arquivos Legados e CNAB 240:**
    - `REMADESAO`: exatamente **250 bytes/linha** + `\r\n` (`Windows-1252`).
    - `REMESSA` (PF/PJ) e `SEG_VIA_*`: exatamente **350 bytes/linha** + `\r\n` (`Windows-1252`).
-   - CNAB 240 Sicoob (`756`): exatamente **240 bytes/linha** + `\r\n`, com DV do Nosso Número calculado por **Módulo 11 peso cíclico `3197`** sobre os **21 dígitos** `AG(4) + CODCED(10) + NOSSONUMERO(7)`.
+   - CNAB 240 Sicoob (`756`): exatamente **240 bytes/linha** + `\r\n` (`Windows-1252`/ASCII, extensão `.REM`), com DV do Nosso Número calculado por **Módulo 11 peso cíclico `3197`** sobre os **21 dígitos** `AG(4) + CODCED(10) + NOSSONUMERO(7)`. Regra validada no Validador oficial Sicoob: **todo título exige no mínimo o par `P` + `Q` com exatamente o mesmo Código de Movimento (`pos 16..17`)** (`Mov '01'` = `P+Q+R` todos `'01'`; `Mov '02'` Baixa = `P+Q` ambos `'02'`, sem `R`; `Mov '04'/'05'` Abatimento = `P+Q` ambos `'04'`/`'05'`, sem `R`), protesto **`"300"`** quando não houver protesto (jamais `"100"`), `NSA` incremental por conta bancária e recálculo exato dos rodapés (`05.5`, `06.5`, `07.5` e `06.9`).
 8. **Correção dos Bugs Críticos do Legado:**
    - Não truncar `NUM_ADESAO` em 4 dígitos no retorno Caixa `104`;
    - Filtrar `SITUACAO = 'A'` dos funcionários no faturamento mensal PJ;
    - Rejeitar CPFs/CNPJs com dígitos repetidos (`111.111.111-11`) em novos cadastros e na remessa CNAB 240;
-   - Aplicar autorização RBAC no servidor em **100% das rotas** (corrigindo os 7 menus desprotegidos do legado).
+   - Aplicar autorização RBAC no servidor em **100% das rotas** (corrigindo os 7 menus desprotegidos do legado);
+   - Blindar o status de registro bancário CNAB em **5 estados** (`NAO_REGISTRADO`, `REGISTRADO`, `BAIXADO`, `LIQUIDADO_BANCO`, `REJEITADO`), lendo obrigatoriamente `MotivoOcorrencia` (`pos 214..223`) no retorno Sicoob e proibindo rebaixar títulos já `REGISTRADO`, `BAIXADO` ou `LIQUIDADO_BANCO` para `NAO_REGISTRADO` em ocorrências `'03'`/`'26'`/`'30'` (ver `04` Seção 3.4.A e `07` item 1.22).
 9. **Idempotência de Lotes e Retornos Bancários:** O reenvio do mesmo arquivo `.ret` CNAB 240 ou planilha Excel não pode duplicar baixas nem sobrescrever baixas já conciliadas sem flag explícita; registrar hash SHA-256 de cada arquivo processado em `lotes_arquivos`.
 10. **Zero Uso dos Ícones `.bmp` Legados:** Não importar `atualizar.bmp`, `Cancelar.bmp`, `Consultar.bmp`, `Excluir.bmp`, `Fechar.bmp`, `fg.bmp` ou `novo.bmp`. Utilizar biblioteca moderna de ícones SVG (`lucide-react`).
 11. **Segurança no Upload e Armazenamento de Documentos (Zero Execução no Servidor):** Todo documento ou anexo enviado ao sistema (`documentos_adesao`, `parceiros_documentos`, logomarcas e banners) deve passar por validação rigorosa de assinatura binária (*magic bytes*) confirmando que o cabeçalho real do arquivo condiz com a extensão permitida em lista fechada (PDF, JPG, PNG), com limite de tamanho e geração de `sha256_hash`. **Nenhum arquivo anexado é lido, interpretado ou executado pelo servidor**: ele é apenas armazenado com chave aleatória (UUID) em Storage externo isolado (S3/R2/Supabase) e servido com cabeçalhos seguros (`X-Content-Type-Options: nosniff` e `Content-Disposition`).
@@ -85,7 +86,7 @@ sgc-web/
 │   │   │   ├── faturamento_pj_service     # Folha ativa PJ mensal + REMESSA PJ (350B)
 │   │   │   ├── consolidacao_debit_service # Agrupamento de atrasados em parcela DEBIT
 │   │   │   ├── baixas_service             # Manual, cascata ÚNICA, estorno auditado
-│   │   │   ├── cnab240_sicoob_writer      # Gerador 240B (Mov '01' P/Q/R e Mov '02' P + DV 3197)
+│   │   │   ├── cnab240_sicoob_writer      # Gerador 240B (Mov '01' P+Q+R, Mov '02'/'04'/'05' P+Q + DV 3197)
 │   │   │   ├── retorno_bancario_parser    # Parser Sicoob 756 (T/U), Caixa 104 (T/U e G) e Excel
 │   │   │   └── segunda_via_service        # Fila persistente SEG_VIA_CARNE / SEG_VIA_CARTAO + PDF
 │   │   ├── diagnostico/                   # Motor de diagnóstico de adesão/cliente/carnê
@@ -136,7 +137,7 @@ Todos os endpoints (exceto `/api/v1/auth/login` e `/api/v1/health`) exigem cabe�
 - `GET /api/v1/cobranca/boletos-elegiveis` -> Filtra títulos para remessa (`dInicio`, `dFim`, `dtpAdimplencia`, `registrado`, `apenas_cpf_valido`).
 - `POST /api/v1/cobranca/cnab240/remessa-registro` (`{ parcela_ids[] }`) -> Gera CNAB 240 Sicoob Mov `'01'` (`P+Q+R`) e marca `registrado = true`.
 - `POST /api/v1/cobranca/remessa-grafica-avulsa` (`{ parcela_ids[] }`) -> Gera arquivo gráfico de 350 colunas para parcelas avulsas.
-- `GET /api/v1/cobranca/candidatos-baixa-bancaria` & `POST /api/v1/cobranca/cnab240/remessa-baixa` (`{ parcela_ids[] }`) -> Gera CNAB 240 Sicoob Mov `'02'` (`P`).
+- `GET /api/v1/cobranca/candidatos-baixa-bancaria` & `POST /api/v1/cobranca/cnab240/remessa-baixa` (`{ parcela_ids[] }`) -> Gera CNAB 240 Sicoob Mov `'02'` (`P+Q` ambos com código `'02'`, sem `R`, protesto `'300'`, `NSA` incremental e extensão `.REM`).
 - `POST /api/v1/parcelas/backfill-nosso-numero` -> Equivalente seguro a `GerarNossoNumero1`.
 - `GET /api/v1/lotes-arquivos` & `GET /api/v1/lotes-arquivos/{id}/download` & `POST /api/v1/lotes-arquivos/recuperar` -> Download e regeneração fiel (`TFrmRecuperarArquivo`).
 - `GET /api/v1/parcelas/busca` (`?chave=...` aceita `NUM_ADESAO+ANOMES` ou `NOSSONUMERO`).
@@ -180,7 +181,7 @@ O banco real `ABAC.FDB` fornecido na pasta do projeto utiliza `ODS 11.2` (Firebi
    9. `DEPFUNCPESSOAJURIDICA` -> `dependentes_func_pj` (preservar `CODIGODEPFUNC`).
    10. `CARNE` -> `carnes` (preservar `NUMERO`, classificar `tipo_carne`: se `NUM_PARC = 1` e houver parcela `'0000'` -> `'ADESAO'`; se pertencer a PJ -> `'FATURA_PJ'`; se parcela `'DEBIT'` -> `'CONSOLIDACAO_DEBIT'`; senão `'CARNE_PF_12M'`).
    11. `PARCELAS` -> `parcelas`:
-       - Preservar `NOSSONUMERO` original;
+       - Preservar `NOSSONUMERO` original e mapear `REGISTRADO` para os 5 estados de `status_registro_cnab_enum` saneando o bug legado do `'03'` (conforme regra exata em `07_pendencias_migracao_e_ajustes_schema.md` item `1.22`);
        - Classificar `situacao_parcela`:
          - Se `DTPAG IS NULL`: `'ABERTA'`;
          - Se `DTPAG IS NOT NULL` e `VALOR_PAGO > 0`: `'PAGA'`;
@@ -209,7 +210,7 @@ Para construir o sistema sem alucinações nem regressões, a IA agêntica deve 
 - **Marco 2 — Autenticação, Segurança, RBAC e Auditoria:** Implementar login JWT, Argon2id, middleware das 18 permissões RBAC, interceptor de `auditoria_eventos` e CRUD de Empresas e Usuários.
 - **Marco 3 — Cadastros Comerciais (Comissionados, Clientes PF e Carteira PJ):** Implementar APIs e telas de Comissionados, Clientes PF + Dependentes (com validação de ficha de adesão e CPF/CNPJ estrito) e Clientes PJ + Funcionários + Dependentes.
 - **Marco 4 — Motores de Emissão e Layouts Gráficos (250B e 350B):** Implementar geração de Adesões (`REMADESAO` 250B), Carnês PF de 13 parcelas (`REMESSA` 350B), Faturamento Mensal PJ corrigido (`REMESSA` 350B), Fila de 2ª Via (`SEG_VIA_CARNE` e `SEG_VIA_CARTÃO` 350B) e Recuperação de Arquivos, com testes automatizados de comprimento exato de linha e posição de cada campo.
-- **Marco 5 — Cobrança Registrada CNAB 240 Sicoob e Consolidação `'DEBIT'`:** Implementar `SicoobNossoNumeroDV` (`3197`), Consolidação de Inadimplentes (`DEBIT`), Remessa CNAB 240 Sicoob Mov `'01'` (`P+Q+R`) e Mov `'02'` (`P`).
+- **Marco 5 — Cobrança Registrada CNAB 240 Sicoob e Consolidação `'DEBIT'`:** Implementar `SicoobNossoNumeroDV` (`3197`), Consolidação/Renegociação de Inadimplentes, Remessa CNAB 240 Sicoob Mov `'01'` (`P+Q+R` todos `'01'`), Mov `'02'` (`P+Q` ambos `'02'`, sem `R`, protesto `'300'`) e Mov `'04'`/`'05'` (`P+Q` Abatimento), com `NSA` incremental.
 - **Marco 6 — Conciliação de Baixas (Manual, Retorno CNAB 240 Sicoob/Caixa e Planilhas):** Implementar Baixa Manual + Estorno, cascata atômica da `'ÚNICA'`, parser CNAB 240 Sicoob `756` e Caixa `104` (sem truncamento de 4 dígitos!) e importador `.xls`/`.xlsx`/`.csv`.
 - **Marco 7 — Diagnóstico e os 7 Relatórios Gerenciais (`HTML + PDF A4 + XLSX`):** Implementar o Diagnóstico de Adesão e todos os 7 relatórios especificados em `05_especificacao_relatorios_rave.md` com cabeçalho institucional e exportação PDF/Excel.
 - **Marco 8 — Polimento UX, Testes E2E e Deploy Cloud:** Revisão de acessibilidade, responsividade desktop/tablet, suíte E2E Playwright e configuração de deploy containerizado (`Dockerfile` + CI/CD).
@@ -241,8 +242,8 @@ A implementação só deve ser considerada concluída pela IA agêntica quando t
    - **Quando** faturada a competência `10/2026`;
    - **Então** o valor gerado na parcela `'01/01'` (`ANOMES = '2610'`) é exatamente **`R\$ 60,00`** (e não `R\$ 100,00` como ocorria no bug legado).
 6. **`test_layouts_posicionais_250_350_240_colunas`:**
-   - **Quando** gerados `REMADESAO`, `REMESSA` PF, `REMESSA` PJ, `SEG_VIA_CARNE`, `SEG_VIA_CARTÃO` e `CNAB 240 Sicoob` (`Mov 01` e `Mov 02`);
-   - **Então** 100% das linhas possuem exatamente `250`, `350` ou `240` bytes em `Windows-1252` (excluindo `\r\n`), e os contadores dos registros Trailer (`99`, `5` e `9`) batem exatamente com a quantidade de linhas/títulos.
+   - **Quando** gerados `REMADESAO`, `REMESSA` PF, `REMESSA` PJ, `SEG_VIA_CARNE`, `SEG_VIA_CARTÃO` e `CNAB 240 Sicoob` (`Mov 01`, `Mov 02`, `Mov 04`/`05`);
+   - **Então** 100% das linhas possuem exatamente `250`, `350` ou `240` bytes em `Windows-1252` com `CR+LF` (no CNAB 240, somente ASCII `32..126`, sem acentos ou caracteres especiais), nenhum `P` sucede diretamente outro `P` (em `Mov 02` e `04`/`05` emite par `P+Q` com mesmo código de movimento nas posições `16..17`, sem `R`, protesto `"300"` quando sem protesto), e os contadores/totais dos registros Trailer (`99`, `5` e `9`) batem exatamente com a quantidade de linhas, títulos e soma de valores.
 7. **`test_retorno_caixa_104_adesao_5_digitos`:**
    - **Dado** arquivo retorno CNAB 240 Caixa `104` contendo liquidação de cliente com `NUM_ADESAO = 19450` (`> 9999`);
    - **Quando** importado em *Baixa Automática*;

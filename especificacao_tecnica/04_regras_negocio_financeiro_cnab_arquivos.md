@@ -296,7 +296,38 @@ Quando o operador filtra inadimplentes com até $K$ parcelas vencidas em aberto 
 
 ### 3.3 CNAB 240 Sicoob (`756`) — Arquivo de Remessa Bancária (`UArquivoRemessa__fn_5aec24`, 240 bytes/linha)
 
-Gerado em `TfrmGerarRemessa` tanto para **Entrada de Títulos (`Mov = '01'`)** quanto para **Pedido de Baixa (`Mov = '02'`)**:
+Gerado para **Entrada de Títulos (`Mov = '01'`)**, **Solicitação de Baixa (`Mov = '02'`)**, **Concessão de Abatimento (`Mov = '04'`)** e **Cancelamento de Abatimento (`Mov = '05'`)**.
+
+#### Regras Obrigatórias de Construção e Validação do Arquivo (Confirmadas no Validador Oficial Sicoob)
+1. **Formato Físico e Nomeação:**
+   - Exatamente **240 bytes por linha** (sem BOM), codificação **ANSI (`Windows-1252`)** / ASCII puro e quebra de linha padrão Windows **`CR+LF` (`\r\n`)**;
+   - Nome do arquivo sem acentos, espaços ou caracteres especiais, com extensão **`.REM`** (padrão Sicoob; opcionalmente `.TXT`).
+2. **Padronização Limpa de Textos (Zero Acentos e Zero Caracteres Especiais):**
+   - Por regra global do novo sistema, todo campo de texto de negócio já nasce armazenado exclusivamente em **letras MAIÚSCULAS, sem acentos, sem cedilha e sem caracteres especiais/pontuação** (`A-Z`, `0-9` e espaços simples). Mesmo assim, o escritor CNAB deve garantir alinhamento à esquerda com espaços à direita (`PadRightSpace`), sem espaços iniciais e sem deixar campos cadastrais obrigatórios do pagador vazios (`Nome`, `Endereço`, `Bairro`, `CEP`, `Cidade`, `UF`).
+3. **Regra de Precedência de Segmentos (Crítica — Validada no Sicoob):**
+   - O Validador CNAB do Sicoob rejeita qualquer arquivo em que um Segmento `P` seja seguido diretamente por outro Segmento `P` (*"Segmento (P) não está precedido por header de lote de título ou segmento (Q, R, S ou Y)"*).
+   - Portanto, **TODO título em QUALQUER código de movimento exige obrigatoriamente, no mínimo, o par `P` + `Q`**:
+     - **Entrada de Títulos (`Mov = '01'`):** emitir **`P` + `Q` + `R`** (todos com `pos 16..17 = "01"`). O Segmento `R` carrega multa, descontos 2/3 e mensagens `Informação 3` e `Informação 4` (descrição clara da parcela/competência no boleto);
+     - **Solicitação de Baixa (`Mov = '02'`):** emitir **`P` + `Q`** (ambos com `pos 16..17 = "02"`), **omitindo o Segmento `R`** (validado e aprovado no Validador oficial do Sicoob). Os campos identificadores do título no Segmento `P` — em especial o bloco completo de `Nosso Número` (`38..57`, incluindo `Parcela`, `Modalidade` e `Tipo de Formulário`) — **devem ser idênticos** aos enviados no registro original para que o Sicoob localize o boleto;
+     - **Concessão / Cancelamento de Abatimento (`Mov = '04'` / `'05'`):** emitir **`P` + `Q`** (ambos com `pos 16..17 = "04"` ou `"05"`), omitindo o Segmento `R`, preenchendo `Valor Abatimento` nas posições `181..195` do Segmento `P`.
+4. **Consistência Estrita do Código de Movimento (`pos 16..17`):**
+   - Todos os segmentos pertencentes ao mesmo título (`P`, `Q` e, quando existir, `R`) **devem carregar exatamente o mesmo Código de Movimento** nas posições `16..17`. *(Correção do bug real do legado `SGCeFeGe.exe`, que emitia `P` com `'02'`, mas gravava `'01'` fixo em `Q` e `R`.)*
+5. **Regra de Protesto (`pos 221..223` do Segmento `P`):**
+   - Quando não houver protesto (padrão da associação e obrigatório na baixa `'02'`), gravar obrigatoriamente **`"3"`** (*Não Protestar / Não Negativar*) na posição `221` + **`"00"`** nas posições `222..223` (`"300"`).
+   - **Jamais** gravar `"1"` (*Protestar dias corridos*) com prazo `"00"` *(bug real do legado `SGCeFeGe.exe`!)*. Somente usar `"1"` ou `"2"` quando houver prazo numérico `> 00` configurado e apenas em remessas de entrada/protesto.
+6. **Evolução Obrigatória do `NSA` (Número Sequencial do Arquivo):**
+   - Incrementar `+1` a cada remessa gerada por conta bancária (`contas_cobranca.nsa_sequencial`), gravando o mesmo sequencial no Header de Arquivo (`pos 158..163`, 6 dígitos) e no Header de Lote (`pos 184..191`, 8 dígitos), evitando rejeição por duplicidade de `NSA` *(no legado ficava preso em `000001`)*.
+7. **Numeração Sequencial e Recálculo Exato dos Rodapés (*Trailers*):**
+   - `pos 9..13` de cada registro de detalhe (`P`, `Q`, `R`): inicia em `00001` no lote e soma `+1` a cada segmento gerado (sem pulos);
+   - **Trailer de Lote (`5`):**
+     - `pos 18..23` (`Qtde de Registros no Lote`) = `1 (Header Lote) + total_linhas_detalhe_no_lote + 1 (Trailer Lote)` *(para $T$ títulos em baixa `P+Q`: $2T + 2$; para $T$ títulos em entrada `P+Q+R`: $3T + 2$)*;
+     - `pos 24..29` (`Qtde de Títulos Cobrança Simples`) = $T$ (quantidade de Segmentos `P`);
+     - `pos 30..46` (`Valor Total`) = soma exata em centavos das posições `86..100` dos $T$ Segmentos `P`;
+     - `pos 47..115` (outras carteiras não utilizadas: Vinculada, Caucionada e Descontada) = `69` zeros (`"0" * 69`);
+   - **Trailer de Arquivo (`9`):**
+     - `pos 18..23` (`Qtde de Lotes`) = quantidade de lotes no arquivo (default `"000001"`);
+     - `pos 24..29` (`Qtde de Registros do Arquivo`) = `1 (Header Arq) + soma(Qtde Registros de cada Lote) + 1 (Trailer Arq)` *(para 1 lote com $T$ títulos: $2T + 4$ em `P+Q` ou $3T + 4$ em `P+Q+R`)*;
+     - `pos 30..35` (`Qtde de Contas Concil.`) = `"000000"`.
 
 #### Header de Arquivo (Tipo `0` — 240 bytes)
 | Pos. | Tam. | Formato | Valor / Regra Exata |
@@ -306,20 +337,20 @@ Gerado em `TfrmGerarRemessa` tanto para **Entrada de Títulos (`Mov = '01'`)** q
 | `8..8` | 1 | `9(1)` | `"0"` (Header de Arquivo) |
 | `9..17` | 9 | `X(9)` | 9 espaços |
 | `18..18` | 1 | `9(1)` | `"1"` se CPF (11 dígitos), `"2"` se CNPJ (14 dígitos) |
-| `19..32` | 14 | `9(14)` | `PadLeftZero(SomenteNumeros(EMPRESAS.CNPJ_EMPRESA), 14)` |
+| `19..32` | 14 | `9(14)` | `PadLeftZero(SomenteNumeros(unidade_matriz.cnpj), 14)` |
 | `33..52` | 20 | `X(20)` | 20 espaços (Convênio em branco no padrão Sicoob) |
-| `53..57` | 5 | `9(5)` | `PadLeftZero(EMPRESAS.AG_BANCOB, 5)` |
-| `58..58` | 1 | `X(1)` | `PadLeftZero(EMPRESAS.DVAG, 1)` |
-| `59..70` | 12 | `9(12)` | `PadLeftZero(EMPRESAS.CONTA_BANCOB, 12)` |
-| `71..71` | 1 | `X(1)` | `PadLeftZero(EMPRESAS.DVCONTA_BANCOB, 1)` |
-| `72..72` | 1 | `X(1)` | `"0"` |
-| `73..102` | 30 | `X(30)` | `PadRightSpace(EMPRESAS.NOME_EMPRESA, 30)` |
+| `53..57` | 5 | `9(5)` | `PadLeftZero(conta_cobranca.agencia, 5)` |
+| `58..58` | 1 | `X(1)` | `PadLeftZero(conta_cobranca.dv_agencia, 1)` |
+| `59..70` | 12 | `9(12)` | `PadLeftZero(conta_cobranca.conta, 12)` |
+| `71..71` | 1 | `9(1)` | `PadLeftZero(conta_cobranca.dv_conta, 1)` |
+| `72..72` | 1 | `X(1)` | `"0"` (DV Ag/Conta = zero no Header de Arquivo conforme manual Sicoob) |
+| `73..102` | 30 | `X(30)` | `PadRightSpace(unidade_matriz.razao_social, 30)` *(MAIÚSCULAS, sem acentos e sem caracteres especiais)* |
 | `103..132` | 30 | `X(30)` | `PadRightSpace("SICOOB", 30)` |
 | `133..142` | 10 | `X(10)` | 10 espaços |
 | `143..143` | 1 | `9(1)` | `"1"` (Remessa Cliente -> Banco) |
 | `144..151` | 8 | `9(8)` | Data de geração (`ddmmyyyy`) |
 | `152..157` | 6 | `9(6)` | Hora de geração (`hhmmss`) |
-| `158..163` | 6 | `9(6)` | `PadLeftZero(sequencial_remessa, 6)` |
+| `158..163` | 6 | `9(6)` | `PadLeftZero(nsa_sequencial, 6)` *(incrementado `+1` a cada remessa gerada)* |
 | `164..166` | 3 | `9(3)` | `"081"` (Versão Layout Arquivo Sicoob) |
 | `167..171` | 5 | `9(5)` | `"00000"` |
 | `172..240` | 69 | `X(69)` | 69 espaços |
@@ -329,89 +360,94 @@ Gerado em `TfrmGerarRemessa` tanto para **Entrada de Títulos (`Mov = '01'`)** q
 |---|---:|---|---|
 | `1..17` | 17 | `X(17)` | `"75600011R01  040 "` (`Lote=0001`, `Tipo=1`, `Oper=R`, `Serv=01`, `LayoutLote=040`) |
 | `18..18` | 1 | `9(1)` | `"1"` (CPF) ou `"2"` (CNPJ) |
-| `19..33` | 15 | `9(15)` | `PadLeftZero(SomenteNumeros(EMPRESAS.CNPJ_EMPRESA), 15)` |
+| `19..33` | 15 | `9(15)` | `PadLeftZero(SomenteNumeros(unidade_matriz.cnpj), 15)` |
 | `34..53` | 20 | `X(20)` | 20 espaços |
-| `54..58` | 5 | `9(5)` | `PadLeftZero(EMPRESAS.AG_BANCOB, 5)` |
-| `59..59` | 1 | `X(1)` | `PadLeftZero(EMPRESAS.DVAG, 1)` |
-| `60..71` | 12 | `9(12)` | `PadLeftZero(EMPRESAS.CONTA_BANCOB, 12)` |
-| `72..72` | 1 | `X(1)` | `PadLeftZero(EMPRESAS.DVCONTA_BANCOB, 1)` |
-| `73..73` | 1 | `X(1)` | `" "` |
-| `74..103` | 30 | `X(30)` | `PadRightSpace(EMPRESAS.NOME_EMPRESA, 30)` |
+| `54..58` | 5 | `9(5)` | `PadLeftZero(conta_cobranca.agencia, 5)` |
+| `59..59` | 1 | `X(1)` | `PadLeftZero(conta_cobranca.dv_agencia, 1)` |
+| `60..71` | 12 | `9(12)` | `PadLeftZero(conta_cobranca.conta, 12)` |
+| `72..72` | 1 | `9(1)` | `PadLeftZero(conta_cobranca.dv_conta, 1)` |
+| `73..73` | 1 | `X(1)` | `" "` (DV Ag/Conta = espaço em branco no Header de Lote conforme manual Sicoob) |
+| `74..103` | 30 | `X(30)` | `PadRightSpace(unidade_matriz.razao_social, 30)` *(MAIÚSCULAS, sem acentos e sem caracteres especiais)* |
 | `104..183` | 80 | `X(80)` | 80 espaços (Mensagens 1 e 2) |
-| `184..191` | 8 | `9(8)` | `PadLeftZero(sequencial_remessa, 8)` |
+| `184..191` | 8 | `9(8)` | `PadLeftZero(nsa_sequencial, 8)` *(mesmo número sequencial do Header de Arquivo)* |
 | `192..199` | 8 | `9(8)` | Data de gravação (`ddmmyyyy`) |
 | `200..207` | 8 | `9(8)` | `"00000000"` |
 | `208..240` | 33 | `X(33)` | 33 espaços |
 
-#### Detalhe — Segmento `P` (Tipo `3` — Obrigatório em `Mov = '01'` e `Mov = '02'`, 240 bytes)
+#### Detalhe — Segmento `P` (Tipo `3` — Obrigatório em TODOS os movimentos: `'01'`, `'02'`, `'04'`, `'05'`, 240 bytes)
 | Pos. | Tam. | Formato | Valor / Regra Exata |
 |---|---:|---|---|
 | `1..8` | 8 | `X(8)` | `"75600013"` |
-| `9..13` | 5 | `9(5)` | `PadLeftZero(seq_registro_no_lote, 5)` (inicia em `00001`, incrementa a cada segmento `P`, `Q`, `R`) |
+| `9..13` | 5 | `9(5)` | `PadLeftZero(seq_registro_no_lote, 5)` (inicia em `00001`, incrementa `+1` a cada segmento `P`, `Q`, `R`) |
 | `14..15` | 2 | `X(2)` | `"P "` |
-| `16..17` | 2 | `9(2)` | `"01"` (Entrada de Títulos) ou `"02"` (Pedido de Baixa) |
-| `18..22` | 5 | `9(5)` | `PadLeftZero(AG_BANCOB, 5)` |
-| `23..23` | 1 | `X(1)` | `PadLeftZero(DVAG, 1)` |
-| `24..35` | 12 | `9(12)` | `PadLeftZero(CONTA_BANCOB, 12)` |
-| `36..36` | 1 | `X(1)` | `PadLeftZero(DVCONTA_BANCOB, 1)` |
+| `16..17` | 2 | `9(2)` | Código de Movimento: `"01"` (Entrada de Títulos), `"02"` (Solicitação de Baixa), `"04"` (Concessão de Abatimento) ou `"05"` (Cancelamento de Abatimento) |
+| `18..22` | 5 | `9(5)` | `PadLeftZero(conta_cobranca.agencia, 5)` |
+| `23..23` | 1 | `X(1)` | `PadLeftZero(conta_cobranca.dv_agencia, 1)` |
+| `24..35` | 12 | `9(12)` | `PadLeftZero(conta_cobranca.conta, 12)` |
+| `36..36` | 1 | `9(1)` | `PadLeftZero(conta_cobranca.dv_conta, 1)` |
 | `37..37` | 1 | `X(1)` | `" "` |
 | `38..47` | 10 | `9(10)` | `PadLeftZero(NOSSONUMERO_7dig + SicoobNossoNumeroDV, 10)` |
-| `48..49` | 2 | `9(2)` | Número da Parcela (`01`..`12`; se `ÚNICA`/`DEBIT`/`ADESÃO`, `"01"`) |
-| `50..51` | 2 | `9(2)` | `PadLeftZero(MODALIDADE_BANCOB, 2)` |
-| `52..52` | 1 | `9(1)` | `"3"` (Tipo Formulário Sicoob: Carnê/A4 sem envelopamento) |
+| `48..49` | 2 | `9(2)` | Número da Parcela (`"01"` quando cada parcela é registrada com Nosso Número individual) |
+| `50..51` | 2 | `9(2)` | `PadLeftZero(conta_cobranca.modalidade, 2)` (ex.: `"01"`) |
+| `52..52` | 1 | `9(1)` | Tipo Formulário Sicoob (`"1"` auto-copiativo, `"3"` auto-envelopável, `"4"` A4 sem envelopamento, `"6"` A4 sem envelopamento 3 vias). *(Nota: o legado sempre gravava `"3"` — em comandos `'02'`/`'04'`/`'05'` sobre títulos já registrados, manter exatamente o mesmo dígito do registro original!)* |
 | `53..57` | 5 | `X(5)` | 5 espaços |
-| `58..58` | 1 | `9(1)` | `PadLeftZero(CARTEIRA_BANCOB, 1)` (`"1"`) |
+| `58..58` | 1 | `9(1)` | `PadLeftZero(conta_cobranca.carteira, 1)` (`"1"`) |
 | `59..62` | 4 | `X(4)` | `"0 22"` (Cadastramento=`0`, Doc=` `, Emissão=`2` Beneficiário, Distribuição=`2` Beneficiário) |
-| `63..77` | 15 | `X(15)` | `PadLeftZero(NUM_ADESAO + ANOMES, 10) + "     "` (Número do Documento) |
-| `78..85` | 8 | `9(8)` | `FormatDateTime("ddmmyyyy", PARCELAS.DTVENC)` |
-| `86..100` | 15 | `9(13)V99` | `PadLeftZero(Round(PARCELAS.VALOR * 100), 15)` |
-| `101..109` | 9 | `X(9)` | `"00000 04N"` (Ag. Cobradora `00000 `, Espécie `04` Duplicata de Serviço/Carnê, Aceite `N`) |
-| `110..117` | 8 | `9(8)` | `FormatDateTime("ddmmyyyy", PARCELAS.DTEM)` |
-| `118..141` | 24 | `9(24)` | **Juros de Mora:** Se `EMPRESAS.JUROSDIA > 0`: `"1"` (`118`, Valor por Dia) + `FormatDateTime("ddmmyyyy", DTVENC)` (`119..126`) + `PadLeftZero(Round(JUROSDIA * 100), 15)` (`127..141`). Se `0`: `24 zeros`. |
-| `142..165` | 24 | `9(24)` | Desconto 1 = `24 zeros` |
-| `166..195` | 30 | `9(30)` | Valor IOF (`15 zeros`) + Valor Abatimento (`15 zeros`) |
-| `196..220` | 25 | `9(25)` | `PadLeftZero(NUM_ADESAO + ANOMES, 25)` (Uso da Empresa — chave de retorno!) |
-| `221..221` | 1 | `9(1)` | `"3"` (Não Protestar) ou `"1"` conforme configuração |
-| `222..223` | 2 | `9(2)` | `"00"` (Prazo Protesto) |
-| `224..227` | 4 | `X(4)` | `"0   "` (Código Baixa/Devolução = `0`, Prazo = `   `) |
+| `63..77` | 15 | `X(15)` | Número do Documento (`15` chars alinhados à esquerda): no sistema novo, `num_adesao + anomes(4) + tipo(1)` (`1`=Carnê/PJ, `2`=Adesão, `3`=Reativação, `4`=Renegociação/Acordo — conforme `07` item 1.5); em baixas de títulos legados, preservar `PadLeftZero(NUM_ADESAO + ANOMES, 10) + 5 espaços` |
+| `78..85` | 8 | `9(8)` | `FormatDateTime("ddmmyyyy", COALESCE(data_vencimento_remessa, data_vencimento))` |
+| `86..100` | 15 | `9(13)V99` | `PadLeftZero(Round(valor_nominal * 100), 15)` |
+| `101..109` | 9 | `X(9)` | `"00000 04N"` (Ag. Cobradora `00000 `, Espécie `04` Duplicata de Serviço, Aceite `N`) |
+| `110..117` | 8 | `9(8)` | `FormatDateTime("ddmmyyyy", data_emissao)` |
+| `118..141` | 24 | `9(24)` | **Juros de Mora:** Se `juros_mora_dia > 0` (em `Mov = '01'`): `"1"` (`118`, Valor por Dia) + `FormatDateTime("ddmmyyyy", vencimento + 1 dia)` (`119..126`, maior que o vencimento) + `PadLeftZero(Round(juros_mora_dia * 100), 15)` (`127..141`). Se `0` (isento): `24 zeros`. |
+| `142..165` | 24 | `9(24)` | Desconto 1 = `24 zeros` (`Cód=0`, `Data=00000000`, `Valor=15 zeros`) |
+| `166..195` | 30 | `9(30)` | Valor IOF (`15 zeros`) + Valor Abatimento (`15` posições `9(13)V99` — preenchido com `valor_abatimento` quando `Mov = '04'` ou no registro `'01'` caso já haja abatimento; `15 zeros` nos demais casos) |
+| `196..220` | 25 | `X(25)` | **Uso Empresa Beneficiário:** No sistema novo, `PadLeftZero(num_carne, 8) + PadLeftZero(num_adesao, 8) + anomes(4)` + `5 espaços` (conforme `07` item 1.5; no legado gravava `16 zeros + NOSSONUMERO(7) + "01"`). Retornado integralmente pelo Sicoob no Segmento `T` (`106..130`)! |
+| `221..221` | 1 | `9(1)` | **`"3"`** (Não Protestar / Não Negativar — padrão obrigatório sem protesto e em toda baixa `'02'`). Usar `"1"`/`"2"` somente se houver protesto ativo com prazo `> 00`. |
+| `222..223` | 2 | `9(2)` | **`"00"`** (Prazo Protesto = `00` quando Código Protesto = `"3"`) |
+| `224..227` | 4 | `X(4)` | `"0   "` (Código Baixa/Devolução = `0`, Prazo = `3 espaços`) |
 | `228..229` | 2 | `9(2)` | `"09"` (Código da Moeda = Real) |
-| `230..239` | 10 | `9(10)` | `"0000000000"` (Número do Contrato) |
+| `230..239` | 10 | `9(10)` | `"0000000000"` (Número do Contrato — zeros em Cobrança Simples) |
 | `240..240` | 1 | `X(1)` | `" "` |
 
-#### Detalhe — Segmento `Q` (Tipo `3` — Emitido somente quando `Mov = '01'`, 240 bytes)
+#### Detalhe — Segmento `Q` (Tipo `3` — **Obrigatório em TODOS os movimentos: `'01'`, `'02'`, `'04'`, `'05'`** — exigido pelo Validador Sicoob, 240 bytes)
 | Pos. | Tam. | Formato | Valor / Regra Exata |
 |---|---:|---|---|
 | `1..8` | 8 | `X(8)` | `"75600013"` |
-| `9..13` | 5 | `9(5)` | `PadLeftZero(seq_registro_no_lote, 5)` |
-| `14..17` | 4 | `X(4)` | `"Q 01"` |
+| `9..13` | 5 | `9(5)` | `PadLeftZero(seq_registro_no_lote, 5)` (sempre `seq_do_P + 1`) |
+| `14..15` | 2 | `X(2)` | `"Q "` |
+| `16..17` | 2 | `9(2)` | **Mesmo Código de Movimento do Segmento `P` imediatamente anterior** (`"01"` Entrada, `"02"` Baixa, `"04"` Abatimento, `"05"` Cancelamento de Abatimento — **nunca** fixar `"01"` em remessa de baixa!) |
 | `18..18` | 1 | `9(1)` | `"1"` (CPF) ou `"2"` (CNPJ) |
-| `19..33` | 15 | `9(15)` | `PadLeftZero(SomenteNumeros(CLIENTES.CPF), 15)` |
-| `34..73` | 40 | `X(40)` | `PadRightSpace(CLIENTES.NOME, 40)` |
-| `74..113` | 40 | `X(40)` | `PadRightSpace(ENDERECO + " " + END_NUMERO + " " + COMPLEMENTO, 40)` |
-| `114..128` | 15 | `X(15)` | `PadRightSpace(CLIENTES.BAIRRO, 15)` |
-| `129..136` | 8 | `9(8)` | `PadLeftZero(SomenteNumeros(CLIENTES.CEP), 8)` |
-| `137..151` | 15 | `X(15)` | `PadRightSpace(CLIENTES.CIDADE, 15)` |
-| `152..153` | 2 | `X(2)` | `PadRightSpace(CLIENTES.ESTADO, 2)` |
-| `154..169` | 16 | `9(16)` | `16 zeros` (Sacador/Avalista) |
-| `170..209` | 40 | `X(40)` | `40 espaços` |
-| `210..212` | 3 | `9(3)` | `"000"` |
-| `213..240` | 28 | `X(28)` | `28 espaços` |
+| `19..33` | 15 | `9(15)` | `PadLeftZero(SomenteNumeros(cpf_ou_cnpj), 15)` *(sempre validado Módulo 11 e sem dígitos repetidos)* |
+| `34..73` | 40 | `X(40)` | `PadRightSpace(nome_pagador, 40)` *(MAIÚSCULAS, sem acentos e sem caracteres especiais)* |
+| `74..113` | 40 | `X(40)` | `PadRightSpace(endereco + " " + end_numero + " " + complemento, 40)` *(sem espaços iniciais, sem acentos/símbolos)* |
+| `114..128` | 15 | `X(15)` | `PadRightSpace(bairro, 15)` *(obrigatório não vazio; sem acentos/símbolos)* |
+| `129..136` | 8 | `9(8)` | `PadLeftZero(SomenteNumeros(cep), 8)` *(CEP `5` + Sufixo `3`, somente dígitos)* |
+| `137..151` | 15 | `X(15)` | `PadRightSpace(cidade, 15)` *(sem acentos/símbolos)* |
+| `152..153` | 2 | `X(2)` | `PadRightSpace(estado, 2)` (UF válida) |
+| `154..169` | 16 | `9(16)` | `16 zeros` (Tipo Inscrição Sacador/Avalista = `"0"` + 15 zeros) |
+| `170..209` | 40 | `X(40)` | `40 espaços` (Nome Sacador/Avalista) |
+| `210..212` | 3 | `9(3)` | `"000"` (Cód. Banco Correspondente = `"000"` quando sem correspondente) |
+| `213..240` | 28 | `X(28)` | `28 espaços` (Nosso Nº Correspondente `20 espaços` + CNAB `8 espaços`) |
 
-#### Detalhe — Segmento `R` (Tipo `3` — Emitido somente quando `Mov = '01'`, 240 bytes)
+#### Detalhe — Segmento `R` (Tipo `3` — Emitido em `Mov = '01'`; **OMITIDO** em `Mov = '02'` [Baixa] e `'04'`/`'05'` [Abatimento], 240 bytes)
 | Pos. | Tam. | Formato | Valor / Regra Exata |
 |---|---:|---|---|
 | `1..8` | 8 | `X(8)` | `"75600013"` |
-| `9..13` | 5 | `9(5)` | `PadLeftZero(seq_registro_no_lote, 5)` |
-| `14..17` | 4 | `X(4)` | `"R 01"` |
+| `9..13` | 5 | `9(5)` | `PadLeftZero(seq_registro_no_lote, 5)` (sempre `seq_do_Q + 1`) |
+| `14..15` | 2 | `X(2)` | `"R "` |
+| `16..17` | 2 | `9(2)` | **Mesmo Código de Movimento do Segmento `P` imediatamente anterior** (ex.: `"01"`) |
 | `18..65` | 48 | `9(48)` | `48 zeros` (Descontos 2 e 3) |
-| `66..89` | 24 | `9(24)` | **Multa:** Se `EMPRESAS.PERCENTMULTA > 0`: `"2"` (`66`, Percentual) + `FormatDateTime("ddmmyyyy", DTVENC)` (`67..74`) + `PadLeftZero(Round(PERCENTMULTA * 100), 15)` (`75..89`). Se `0`: `24 zeros`. |
-| `90..199` | 110 | `X(110)` | `110 espaços` |
-| `200..231` | 32 | `X(32)` | `16 zeros` + `" "` + `12 zeros` + `"  0"` |
+| `66..89` | 24 | `9(24)` | **Multa:** Se `percentual_multa > 0`: `"2"` (`66`, Percentual) + `FormatDateTime("ddmmyyyy", vencimento + 1 dia)` (`67..74`, maior que o vencimento) + `PadLeftZero(Round(percentual_multa * 100), 15)` (`75..89`). Se `0`: `24 zeros`. |
+| `90..99` | 10 | `X(10)` | `10 espaços` (Informação ao Pagador) |
+| `100..139` | 40 | `X(40)` | `Informação 3` — descrição legível da parcela/competência/tipo em MAIÚSCULAS sem acentos/caracteres especiais (ou 40 espaços quando não utilizada) |
+| `140..179` | 40 | `X(40)` | `Informação 4` — complemento da descrição no boleto em MAIÚSCULAS sem acentos/caracteres especiais (ou 40 espaços) |
+| `180..199` | 20 | `X(20)` | `20 espaços` (CNAB) |
+| `200..231` | 32 | `X(32)` | `16 zeros` (`DtLimPag 8` + `BcoDeb 3` + `AgDeb 5`) + `" "` (`DVAgDeb`) + `12 zeros` (`CtaDeb`) + `"  0"` (`DVCta`, `DVAgCta`, `AvisoDeb='0'`) |
 | `232..240` | 9 | `X(9)` | `9 espaços` |
 
 #### Trailer de Lote (`5`) e Trailer de Arquivo (`9`) — 240 bytes cada
-- **Trailer de Lote (`5`):** `1..8 = "75600015"`, `9..17 = 9 espaços`, `18..23 = PadLeftZero(qtd_reg_lote, 6)` (Header Lote + todos `P/Q/R` + Trailer Lote), `24..29 = PadLeftZero(qtd_titulos, 6)`, `30..46 = PadLeftZero(soma_valores_centavos, 17)`, `47..115 = 69 zeros`, `116..240 = 125 espaços`.
-- **Trailer de Arquivo (`9`):** `1..8 = "75699999"`, `9..17 = 9 espaços`, `18..23 = "000001"`, `24..29 = PadLeftZero(qtd_total_linhas_arquivo, 6)`, `30..35 = "000000"`, `36..240 = 205 espaços`.
+- **Trailer de Lote (`5`):** `1..8 = "75600015"`, `9..17 = 9 espaços`, `18..23 = PadLeftZero(qtd_reg_lote, 6)` (`1` Header Lote + todos `P/Q/R` do lote + `1` Trailer Lote), `24..29 = PadLeftZero(qtd_titulos_P, 6)`, `30..46 = PadLeftZero(soma_valores_centavos_P, 17)`, `47..115 = 69 zeros` (demais carteiras zeradas), `116..240 = 125 espaços` (Aviso `8` + CNAB `117`).
+- **Trailer de Arquivo (`9`):** `1..8 = "75699999"`, `9..17 = 9 espaços`, `18..23 = PadLeftZero(qtd_lotes, 6)` (`"000001"`), `24..29 = PadLeftZero(qtd_total_linhas_arquivo, 6)`, `30..35 = "000000"`, `36..240 = 205 espaços`.
 
 ---
 
@@ -458,14 +494,30 @@ O parser inspeciona `Copy(linha, 1, 3)` (código do banco) e `linha[8]` (tipo de
    - `NossoNumeroSemDV = StrToInt(Copy(linha, 38, 9))` (posições `38..46` — 9 dígitos sem o 10º dígito verificador!).
    - `SeuNumero / UsoEmpresa` = fallback `NUM_ADESAO + ANOMES` em `Copy(linha, 59, 15)` / `Copy(linha, 106, 25)`.
    - `ValorTarifa = StrToCurr(Copy(linha, 199, 15)) / 100` (posições `199..213` -> alimenta `PARCELAS.VALOR_COMP`!).
+   - **`MotivoOcorrencia = Copy(linha, 214, 10)`** (posições `214..223` — até 5 códigos de 2 caracteres indicando o motivo exato da ocorrência/rejeição, ex.: `'A5'` = *título baixado, liquidado ou quitado*).
 2. **No Segmento `U` subsequente (`linha[14] = 'U'`):**
    - `ValorPago = StrToCurr(Copy(linha, 78, 15)) / 100` (posições `78..92`).
    - `ValorLiquidoCreditado = StrToCurr(Copy(linha, 93, 15)) / 100` (posições `93..107`).
    - `DataOcorrencia = ParseDDMMYYYY(Copy(linha, 138, 8))` (posições `138..145` -> alimenta `PARCELAS.DTPAG`).
-3. **Ação por Código de Movimento (`CodMovimento`):**
-   - `'02'` (**Entrada Confirmada**): Atualiza `PARCELAS.REGISTRADO = 'S'` onde `NOSSONUMERO = NossoNumeroSemDV`.
-   - `'03'` (**Entrada Rejeitada**) ou `'09'` (**Baixa Comandada/Simples**): Atualiza `PARCELAS.REGISTRADO = 'N'`.
-   - `'06'` (**Liquidação**): Atualiza `DTPAG = DataOcorrencia`, `VALOR_PAGO = ValorPago`, `VALOR_COMP = ValorTarifa` (ou `ValorPago - ValorLiquidoCreditado` quando tarifa vier embutida) **e executa a cascata automática caso `ID_PARC = 'ÚNICA'`!**
+3. **Comportamento Real Verificado no Binário Legado (`UBaixaAutomatica` @ `0x58ee18..0x58f05e`):**
+   - `'02'` (**Entrada Confirmada**): gravava `PARCELAS.REGISTRADO = 'S'`;
+   - `'03'` (**Rejeição**): gravava **`PARCELAS.REGISTRADO = 'N'` cegamente**, sem ler `MotivoOcorrencia` (`214..223`) e sem verificar o estado anterior — causando o bug histórico de rebaixar títulos já `'S'` ou `'B'` (inclusive títulos pagos no banco ou retornados com motivo `'A5'`) para `'N'`;
+   - `'09'` (**Baixa Comandada/Simples**): gravava `PARCELAS.REGISTRADO = 'B'`;
+   - `'06'` (**Liquidação**): gravava `DTPAG`, `VALOR_PAGO`, `VALOR_COMP` e executava cascata da `'ÚNICA'`, mas **não alterava `REGISTRADO`** (deixando títulos pagos no banco presos em `'S'`).
+4. **Regra Blindada Obrigatória no Novo Sistema Web (Máquina de Estados de 5 Estados — "Caminho Sem Volta"):**
+   O campo de registro bancário em `parcelas` adota **5 estados explícitos** (`NAO_REGISTRADO`, `REGISTRADO`, `BAIXADO`, `LIQUIDADO_BANCO`, `REJEITADO`), com leitura obrigatória de `MotivoOcorrencia` (`pos 214..223`):
+   - **`'02'` (Entrada Confirmada):** Atualiza para **`REGISTRADO`** (limpando eventual erro anterior em `codigo_rejeicao_cnab`/`motivo_rejeicao_cnab`).
+   - **`'06'` (Liquidação):** Atualiza `data_pagamento = DataOcorrencia`, `valor_pago = ValorPago`, `valor_compensacao = ValorTarifa` (ou `ValorPago - ValorLiquidoCreditado`), define **`LIQUIDADO_BANCO`** (nunca deixando preso em `REGISTRADO`!) e executa a cascata automática caso `tipo_parcela = 'COTA_UNICA_ANUAL'` (`'UNICA'`).
+   - **`'09'` (Baixa Comandada/Simples):** Atualiza para **`BAIXADO`** (sem alterar `data_pagamento`/`valor_pago` já registrados em carteira).
+   - **`'03'` (Rejeição), `'26'` (Instrução Rejeitada) ou `'30'` (Alteração Rejeitada) — PROIBIDO REBAIXAR PARA `NAO_REGISTRADO`:**
+     - Um título já em **`REGISTRADO`**, **`BAIXADO`** ou **`LIQUIDADO_BANCO`** **JAMAIS** pode retornar para `NAO_REGISTRADO`;
+     - **Se `MotivoOcorrencia` contiver `'A5'` (*título baixado, liquidado ou quitado*):** se a parcela foi paga no banco (`valor_compensacao > 0` ou já `LIQUIDADO_BANCO`), manter/definir **`LIQUIDADO_BANCO`**; caso contrário (paga em carteira/cancelada/cascata), definir **`BAIXADO`** — nunca `NAO_REGISTRADO`;
+     - **Se o motivo indicar título já existente/duplicado no banco** (reenvio acidental de entrada): manter **`REGISTRADO`** e registrar alerta no resumo do retorno (`lotes_arquivos.resumo_processamento`) e em `auditoria_eventos`;
+     - **Se for rejeição de instrução/alteração** (ex.: abatimento `'04'`/`'05'` recusado em título ativo): preservar o status atual (`REGISTRADO`) e gravar código/descrição do motivo em `codigo_rejeicao_cnab`/`motivo_rejeicao_cnab` + `auditoria_eventos`;
+     - **Somente se o título ainda era `NAO_REGISTRADO` (1ª tentativa de entrada `'01'`)** e foi recusado por erro cadastral/layout (ex.: CPF/CEP inválido): marcar como **`REJEITADO`** salvando `codigo_rejeicao_cnab` e `motivo_rejeicao_cnab` para correção e reenvio.
+   - **Travas Obrigatórias na Geração de Remessas:**
+     - Remessa de Entrada (`'01'`): seleciona apenas parcelas com `situacao_parcela = 'ABERTA'` e status bancário **`NAO_REGISTRADO`** ou **`REJEITADO`**;
+     - Remessa de Baixa (`'02'`): seleciona apenas parcelas com status bancário **`REGISTRADO`** (jamais `LIQUIDADO_BANCO` ou `BAIXADO`).
 
 #### B. Retorno Caixa Econômica Federal (`104`) — Cobrança (`T`/`U`) e Arrecadação (`G`)
 1. **Variante Cobrança (`Segmentos T + U`):**
@@ -497,3 +549,5 @@ Cada linha de dados da planilha selecionada contém **3 colunas**:
 | 8 | Repetição de `EMPRESA.CEP` nas colunas `184..213` do Header `REMESSA` | `UCarne` (`0x595f3c`), `UsegundaVia` | **Manter por padrão no exportador legado de 350 colunas** (para não quebrar máscara da gráfica!), com flag opcional `corrigir_bairro_header_grafica` |
 | 9 | Rótulos invertidos/antigos `&SICAP` / `&SIGCB` em `TFrmClientes.Rbanco` | `TFrmClientes.dfm` | Exibir nomes claros: `1 - Caixa Econômica Federal` e `2 - Sicoob (756)` |
 | 10 | Concatenação direta de SQL com datas `mm/dd/yyyy` (SQL Injection) | Todas as units de consulta/relatório | `100%` Prepared Statements / ORM parametrizado com tipos `DATE` nativos |
+| 11 | Remessa CNAB 240 Baixa (`'02'`) emitindo Segmentos `Q` e `R` com código `'01'`, protesto contraditório `'100'` (`1` + `00` dias), `NSA` fixo `'000001'` e acentos/símbolos | `UArquivoRemessa__fn_5aec24` | Gerar `P` + `Q` **ambos com código `'02'`** (sem `R`), protesto `'300'` (não protestar), `NSA` incremental por conta bancária, extensão `.REM` e textos 100% em MAIÚSCULAS sem acentos nem caracteres especiais (validado no Validador Sicoob) |
+| 12 | Rebaixamento cego de `REGISTRADO` (`S`/`B` $\to$ `N`) ao ler retorno Sicoob código `'03'` sem verificar `MotivoOcorrencia` (`214..223`), e liquidação `'06'` mantendo título como `'S'` | `UBaixaAutomatica` (`0x58eeac..0x58f05e`) | Máquina de estados de 5 valores (`NAO_REGISTRADO`, `REGISTRADO`, `BAIXADO`, `LIQUIDADO_BANCO`, `REJEITADO`), proibição de rebaixar `REGISTRADO`/`BAIXADO`/`LIQUIDADO_BANCO` para `NAO_REGISTRADO`, leitura obrigatória de `pos 214..223` (`A5` $\to$ `BAIXADO`/`LIQUIDADO_BANCO`) e liquidação `'06'` marcando `LIQUIDADO_BANCO` |
