@@ -13,6 +13,8 @@ O binário `SGCeFeGe.exe` contém **43 recursos `RCData` de formulários/módulo
 
 > **Nota sobre ícones `.bmp` na pasta do sistema:** Os arquivos `atualizar.bmp`, `Cancelar.bmp`, `Consultar.bmp`, `Excluir.bmp`, `Fechar.bmp`, `fg.bmp` e `novo.bmp` eram utilizados como glifos de `TBitBtn`/`TSpeedButton` e logotipos na VCL legada. Conforme diretriz do projeto, **não serão utilizados** no novo sistema web, devendo ser substituídos por ícones vetoriais modernos (`Lucide Icons` ou `Heroicons`) com rótulos acessíveis (`aria-label`).
 
+> **Regra Transversal de Digitação (Somente MAIÚSCULAS, Sem Acentos e Sem Caracteres Especiais):** Em todas as telas e campos de texto de negócio do sistema (cadastros, buscas, observações, motivos, endereços, bairros, cidades, etc.), a interface deve **sanitizar a entrada do teclado e colagens (`Ctrl+V`) em tempo real**, convertendo para **MAIÚSCULAS** e removendo acentos/diacríticos, cedilha e **caracteres especiais/pontuações** (mantendo apenas letras `A-Z`, números `0-9` e espaços simples), de modo que na tela, no banco e nos arquivos bancários CNAB 240 existam apenas caracteres limpos *(exceto campos técnicos específicos: senhas, e-mails, URLs/links, `@instagram` e campos numéricos com máscara visual de tela como CPF, CNPJ, CEP, telefone e moeda)*.
+
 ---
 
 ## 2. Módulos de Dados (`DataModules`) e Regras Persistentes de `TField`

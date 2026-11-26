@@ -200,7 +200,7 @@
   * **Remover `DEFAULT 'PF_PRE_IMPRESSO'`** de `tipo_contrato` (novos contratos serão apenas `'PF'` ou `'PJ'`).
   * **`empresa_id` $\to$ `unidade_id`:** Indica a unidade de origem do contrato (não aponta para cliente; são `clientes_pf.numero` e `clientes_pj.numero` que apontam para `adesoes.numero`).
   * Manter `data_emissao` (data comercial/contratual) + `created_at` / `created_by` (auditoria técnica exata).
-* **ETL:** Listagens antigas de números de adesão pré-impressos não utilizados não precisam ser migradas.
+* **ETL:** Listagens antigas de números de adesão pré-impressos não utilizados (sem cliente vinculado em `CLIENTES` ou `PESSOAJURIDICA`), bem como seus registros vazios correspondentes em `CARNE` e `PARCELAS` (`ANOMES = '0000'`), não serão migradas (ver detalhamento completo no item **6** da Seção 2).
 
 ---
 
@@ -231,9 +231,13 @@
 
 ---
 
-### 1.14 Busca Inteligente por Fragmentos de Nome (`pg_trgm` + `unaccent`)
-* **Comportamento Esperado na Busca de Clientes/Dependentes:** Ao digitar múltiplos fragmentos separados por espaço (ex.: `"gus ri car"` ou até meios de palavras como `"tav eir pan"` para localizar `"GUSTAVO RIBEIRO CARPANEZ"`), o backend deve quebrar o termo pelos espaços e aplicar filtro `AND` com `ILIKE '%termo%'` ignorando acentos (`unaccent`), aproveitando os índices `GIN (gin_trgm_ops)`.
-* **Ajuste Técnico no Schema:** Avaliar uso de expressão/coluna normalizada (ex.: `unaccent` imutável ou coluna gerada sem acento indexada com `gin_trgm_ops`) para garantir que o índice `GIN` seja usado mesmo com remoção de acentos.
+### 1.14 Busca Inteligente por Fragmentos de Nome (`pg_trgm` + `unaccent`) e Padronização Global de Texto
+* **Regra Global — Somente Letras MAIÚSCULAS, Sem Acentos e Sem Caracteres Especiais/Pontuação:** Todo o texto de negócio do sistema (nomes, endereços, bairros, cidades, observações, motivos, descrições, etc.) deve existir **exclusivamente em letras MAIÚSCULAS, SEM ACENTOS e SEM CARACTERES ESPECIAIS/PONTUAÇÕES** (permitindo apenas `A-Z`, `0-9` e espaços simples), tanto na exibição/digitação em tela quanto no banco de dados PostgreSQL — eliminando automaticamente qualquer risco de acentos ou pontuação nos arquivos bancários CNAB 240.
+  * **Sanitização em Tempo Real (Frontend):** Os campos de texto devem tratar a digitação (e colagem via Ctrl+V) em tempo real, removendo acentos/diacríticos (ex.: `á` $\to$ `A`, `ç` $\to$ `C`, `ã` $\to$ `A`), removendo caracteres especiais e pontuações (`.`, `,`, `(`, `)`, `/`, `:`, `;`, `'`, `-`, etc.), colapsando espaços duplicados e convertendo para maiúsculas imediatamente no input, para que na tela só apareçam letras maiúsculas, números e espaços.
+  * **Blindagem no Backend e Banco:** A API também deve reforçar a mesma sanitização (`UPPER` + `unaccent` + remoção de `[^A-Z0-9 ]` + `TRIM` / colapso de espaços) antes de persistir no PostgreSQL, garantindo integridade mesmo fora da UI web.
+  * **Exceções Técnicas Naturais:** Campos que por natureza exigem minúsculas ou caracteres especiais não entram nessa conversão: **senhas** (antes do hash), **e-mails**, **URLs / links externos** (ex.: `google_maps_url`, redes sociais como `@instagram`), chaves de Storage e **máscaras visuais de campos numéricos** (CPF, CNPJ, CEP, telefone, datas e moeda — que armazenam apenas dígitos/tipos nativos no banco).
+* **Comportamento Esperado na Busca de Clientes/Dependentes:** Ao digitar múltiplos fragmentos separados por espaço (ex.: `"gus ri car"` ou até meios de palavras como `"tav eir pan"` para localizar `"GUSTAVO RIBEIRO CARPANEZ"`), o input já sanitiza para maiúsculas sem acento e sem símbolos, e o backend quebra o termo pelos espaços aplicando filtro `AND` com `ILIKE '%termo%'`, aproveitando diretamente os índices `GIN (gin_trgm_ops)`.
+* **Ajuste Técnico no Schema:** Como todos os textos gravados nas tabelas já estarão normalizados em **MAIÚSCULAS, sem acentos e sem caracteres especiais**, o índice `GIN (gin_trgm_ops)` atua diretamente sobre as colunas de nome sem necessidade de colunas extras (mantendo a extensão `unaccent` disponível para o ETL e sanitização de consultas).
 
 ---
 
@@ -334,9 +338,10 @@
   * Adicionar **`situacao_parcela situacao_parcela_enum NOT NULL DEFAULT 'ABERTA'`** (`ABERTA`, `PAGA`, `QUITADA_POR_UNICA`, `RENEGOCIADA`, `QUITADA_POR_ACORDO`, `PERDOADA`, `CANCELADA`);
   * Adicionar **`valor_taxa_manutencao_embutida NUMERIC(12, 2) NOT NULL DEFAULT 0.00`** para registrar, na parcela `'01/12'` e na `'UNICA'` dos carnês de renovação PF, quanto do `valor_nominal` corresponde à **Taxa de Manutenção Anual** ($A$) e quanto corresponde à mensalidade base ($M$).
 * **`id_parc`:** Ampliar de `VARCHAR(10)` para **`VARCHAR(15)`** (mantido como rótulo visual impresso no boleto/carnê, sem acento e em maiúsculas). Para carnês PF de `13` registros (`num_parcelas = 13`), manter obrigatoriamente a numeração **`'UNICA'`** e **`'01/12'` a `'12/12'`**. Para parcelas de renegociação parcelada, adotar o padrão **`'REN 01/04'`**, além de `'ADESAO'`, `'REATIVACAO'`, `'MANUTENCAO'`, `'01/01'` (PJ) e `'DEBIT'` (legado 1x).
-* **Obrigatoriedade de `baixado_por_usuario_id`:** Avaliar na migração entre:
-  1. Atribuir o ID do administrador (ou usuário técnico de migração) a todas as baixas legadas e criar trava no banco garantindo obrigatoriedade **quando paga** (`CHECK (data_pagamento IS NULL OR baixado_por_usuario_id IS NOT NULL)`) — lembrando que parcelas em aberto precisam aceitar `NULL`; **ou**
-  2. Manter livre para o histórico legado e exigir obrigatoriedade apenas no backend para todas as novas baixas no sistema novo.
+* **Obrigatoriedade de `baixado_por_usuario_id` (Decisão Fechada):**
+  * Incluir no **seed inicial do banco** um usuário técnico de sistema com login **`MIGRACAO_LEGADO`**, nome `MIGRACAO DO SISTEMA LEGADO` e **`ativo = FALSE`** (bloqueado para login, apenas para rastreabilidade histórica);
+  * Na migração (`ABAC.FDB` $\to$ PostgreSQL), preencher `baixado_por_usuario_id` com o `id` desse usuário técnico em todas as baixas vindas do legado;
+  * Ativar a trava rígida no banco garantindo obrigatoriedade **quando paga**: **`CHECK (data_pagamento IS NULL OR baixado_por_usuario_id IS NOT NULL)`** *(mantendo `NULL` para parcelas em aberto)*.
 * **Abatimento de Parcelas e Instrução CNAB (`valor_abatimento`):**
   * Adicionar **`valor_abatimento NUMERIC(12, 2) NOT NULL DEFAULT 0.00`** (mantendo o `valor_nominal` original do carnê impresso; o valor líquido a cobrar passa a ser `valor_nominal - valor_abatimento`) e **`abatimento_pendente_cnab BOOLEAN NOT NULL DEFAULT FALSE`** (para enfileirar parcelas já registradas no banco que precisam de instrução CNAB `'04'` Concessão de Abatimento ou `'05'` Cancelamento de Abatimento na próxima remessa ao Sicoob).
 * **Código de Barras, Linha Digitável e Boleto Híbrido Pix (`parcelas`):**
@@ -947,14 +952,37 @@
    * Para cada registro legado: aplicar `SomenteNumeros(CPF)` e validar **Módulo 11 + rejeição de dígitos repetidos** (`00000000000`, `11111111111`, etc.).
    * **Se válido (e não duplicado):** gravar os 11 dígitos em `clientes_pf.cpf`.
    * **Se inválido ou vazio:** gravar `clientes_pf.cpf = NULL` e preservar o valor original exato do legado em **`cpf_legado_bruto`** (sinalizando para saneamento cadastral sem perder histórico).
-2. **Auditoria de CPFs Duplicados:**
-   * Antes da carga final, rodar query de detecção de CPFs válidos duplicados no Firebird (`UNIQUE (cpf)` será aplicado em `clientes_pf`) para decisão/unificação pelo operador.
+2. **Relatório Prévio de Saneamento e Auditoria de CPFs Duplicados:**
+   * Antes da carga final, rodar levantamento completo no `ABAC.FDB` para detectar:
+     * CPFs válidos duplicados dentro de `CLIENTES` (ex.: ex-clientes que fizeram novo cadastro antes de existir o fluxo de reativação) — `UNIQUE (cpf)` será aplicado em `clientes_pf`, exigindo decisão/unificação ou preservação temporária em `cpf_legado_bruto` com `cpf = NULL`;
+     * CPFs cruzados ativos entre `CLIENTES`, `DEPENDENTES` e `FUNCIONARIOSPESSOAJURIDICA` (para saneamento gradual pós-migração, sem excluir contratos assinados existentes).
 3. **Migração de Telefones Legados:**
    * Mapear `TELEFONE_CELULAR` $\to$ `telefone1`, `TELEFONE_COMERCIAL` $\to$ `telefone2`, `TELEFONE_FAX` $\to$ `telefone3` (com flags `*_whatsapp = FALSE`).
 4. **Verificação de `DIAVENC` Legado:**
    * Checar no `ABAC.FDB` se existem clientes ativos/históricos com `DIAVENC` fora de `(5, 10, 15, 20, 25)` antes de definir `CHECK` rígido no PostgreSQL.
 5. **Mapeamento de `PARCELAS` Históricas:**
    * Verificar no banco Firebird atual se existem parcelas com `ANOMES` `'YY98'`, `'YY99'` e taxas `'0000'` para garantir que todas migrem com `origem_baixa = 'LEGADO'` e o status correto.
+6. **Tratamento de Adesões Vazias, Adesões Perdidas (`> 180 dias`) e Adesões Recentes sem Baixa (`<= 180 dias`):**
+   * **A. Adesões Vazias (sem cliente em `CLIENTES` nem em `PESSOAJURIDICA`):** Descartar integralmente na migração os registros órfãos de `ADESAO`, `CARNE` (`NUM_PARC = 1`) e `PARCELAS` (`ANOMES = '0000'`) que nunca tiveram cliente cadastrado, mantendo esses números históricos como "pulados" e sincronizando `seq_adesao_numero` a partir de `MAX(NUMERO) + 1`.
+   * **B. Adesões Perdidas / Antigas (`INSCRICAO < Data_Migracao - 180 dias` e parcela `'0000'` não paga):**
+     * **Se o CPF for inválido ou vazio** (falhar no Módulo 11 ou tiver todos os dígitos repetidos): **excluir/descartar integralmente na migração** (cliente, dependentes, `ADESAO`, `CARNE` e `PARCELA '0000'`), pois nunca houve pagamento/carnê nem há CPF válido para futura reativação;
+     * **Se o CPF for válido:** migrar o cadastro do cliente para preservar o histórico (caso retorne no futuro via Reativação pelo CPF), porém definindo automaticamente **`situacao = 'C'` (Cancelado)**, **`motivo_cancelamento = 'Cancelado por não pagamento de adesão.'`** (com `data_cancelamento` preenchida) e marcando a parcela `'0000'` como **`situacao_parcela = 'CANCELADA'`**.
+   * **C. Adesões Recentes sem Baixa (`INSCRICAO >= Data_Migracao - 180 dias` e parcela `'0000'` não paga — Erro de Operação):**
+     * Como no atendimento presencial o cliente já pagou a adesão no ato do cadastro e a ausência de baixa na `'0000'` decorre de esquecimento operacional da colaboradora (o que impedia o legado de gerar o 1º carnê), listar todos esses registros separadamente no **Relatório Prévio de Saneamento** antes da virada;
+     * Para os registros confirmados, liquidar a parcela `'0000'` na migração (`situacao_parcela = 'PAGA'`, `origem_baixa = 'LEGADO'`) e **inserir automaticamente o cliente na `fila_geracao_carnes` (`status = 'PENDENTE'`)** para emissão imediata do seu 1º carnê no sistema novo.
+7. **Normalização Global de Texto (`MAIÚSCULAS`, `SEM ACENTOS` e `SEM CARACTERES ESPECIAIS`):**
+   * Durante a migração do `ABAC.FDB` para o PostgreSQL, aplicar conversão para **MAIÚSCULAS, remoção de acentos/cedilha e remoção de caracteres especiais/pontuações** (substituindo `[^A-Z0-9 ]` por espaço e colapsando espaços múltiplos) em todos os campos de texto de negócio (nomes, endereços, bairros, cidades, observações, motivos, etc.), preservando em formato original apenas exceções técnicas (e-mails, URLs, `@instagram` e hashes de senha).
+   * **Proteção contra campo obrigatório zerado após limpeza:** Na auditoria real da base `ABAC.FDB`, foram encontrados registros cujo campo obrigatório continha apenas pontuação (ex.: `BAIRRO = '.'`). Quando um campo `NOT NULL` (como `endereco`, `bairro` ou `cidade`) ficar vazio após a remoção de caracteres especiais, preencher com **`NAO INFORMADO`** na carga e listar o registro no **Relatório Prévio de Saneamento** para regularização cadastral (evitando quebra na migração e rejeição futura no Segmento `Q` do CNAB 240).
+8. **Inclusão no Seed e Vínculo do Usuário Técnico `MIGRACAO_LEGADO`:**
+   * O script de **seed inicial** do banco deve criar obrigatoriamente o usuário técnico **`MIGRACAO_LEGADO`** (nome `MIGRACAO DO SISTEMA LEGADO`, `ativo = FALSE`, senha aleatória inutilizável, sem acesso de login).
+   * Na carga de `PARCELAS`, atribuir o `id` desse usuário ao campo `baixado_por_usuario_id` de todas as parcelas legadas já pagas, viabilizando a constraint `CHECK (data_pagamento IS NULL OR baixado_por_usuario_id IS NOT NULL)`.
+9. **Saneamento Manual Obrigatório de Nomes com Anotações e Informações Variadas (Varredura Prévia pela IA):**
+   * **Problema Real Encontrado no `ABAC.FDB`:** No sistema legado, foram digitadas informações operacionais e recados variados misturados diretamente dentro do campo `NOME` (em `CLIENTES`, `DEPENDENTES`, `PESSOAJURIDICA`, `FUNCIONARIOSPESSOAJURIDICA` e `DEPFUNCPESSOAJURIDICA`), como textos entre parênteses (ex.: `(UNIDADE)`, `(ENTREGAR NA FILIAL)`, indicações de destino/retirada), números, barras, abreviações de status ou parênteses truncados no limite de caracteres.
+   * **Proibição de Limpeza Automática Cega:** A retirada dessas informações extras nos nomes **deve ser feita manualmente**, **nunca** por exclusão automática no script de migração — para evitar cortar partes do nome verdadeiro da pessoa ou perder informações operacionais que precisem ser conferidas/movidas para o campo adequado.
+   * **Procedimento Obrigatório Antes da Carga Final:**
+     1. **Varredura pela IA:** Solicitar à IA que vasculhe integralmente o `ABAC.FDB` (titulares PF, dependentes PF, empresas PJ, funcionários PJ e dependentes PJ) e identifique todos os registros cujo campo `NOME` contenha parênteses, caracteres especiais/pontuação, números, palavras/recados operacionais (ex.: indicações de unidade, entrega, envio, cancelamento, observações) ou qualquer padrão incomum;
+     2. **Listagem para Conferência Manual:** Gerar um relatório local (protegido no `.gitignore` / fora do Git por LGPD) listando esses registros para conferência manual e limpeza pela equipe responsável;
+     3. **Aplicação Pós-Aprovação:** Somente após a revisão manual e limpeza aprovada pela equipe, aplicar os nomes corrigidos na carga definitiva para o PostgreSQL (respeitando também a regra global de MAIÚSCULAS, sem acentos e sem caracteres especiais).
 
 ---
 
