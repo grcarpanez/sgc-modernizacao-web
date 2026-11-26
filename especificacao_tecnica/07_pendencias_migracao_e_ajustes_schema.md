@@ -8,12 +8,15 @@
 
 ## 1. Ajustes Pendentes no Schema (`02_schema_postgresql_moderno.sql`)
 
-### 1.1 Unicidade de CPF em `clientes_pf`
+### 1.1 Unicidade de CPF em `clientes_pf` e Bloqueio Cruzado no PF
 * **Estado Atual no SQL Moderno:** `clientes_pf.cpf` possui apenas um índice simples (`idx_clientes_pf_cpf`), sem constraint `UNIQUE`.
-* **Decisão de Negócio:** O sistema **deve impedir** a criação de dois cadastros para o mesmo CPF (ex-clientes que retornam devem passar pelo fluxo de **Reativação** — ver `08_rotinas_operacionais_nao_documentadas.md`).
+* **Decisão de Negócio:**
+  * O sistema **deve impedir** a criação de dois cadastros de Titular PF para o mesmo CPF (ex-clientes que retornam devem passar pelo fluxo de **Reativação** — ver `08_rotinas_operacionais_nao_documentadas.md`).
+  * Para **novos cadastros e inclusões no sistema novo**, o **backend** deve bloquear também que um mesmo CPF fique **Ativo (`situacao = 'A'`)** em mais de um vínculo PF ao mesmo tempo (Titular PF Ativo $\times$ Dependente PF Ativo). Se o vínculo anterior estiver Cancelado (`'C'`) ou Inativo (`'I'`), o CPF fica livre (e no cruzamento PF $\times$ PJ exibe apenas **alerta forte com confirmação**, sem bloqueio).
 * **Ação no Schema:**
   * Adicionar `CONSTRAINT uq_clientes_pf_cpf UNIQUE (cpf)` em `clientes_pf`.
-  * *Nota técnica PostgreSQL:* `UNIQUE (cpf)` permite múltiplos `NULL` (usado para CPFs inválidos/ausentes do legado preservados em `cpf_legado_bruto`), mas bloqueia estritamente qualquer CPF válido duplicado.
+  * *Nota técnica PostgreSQL:* `UNIQUE (cpf)` permite múltiplos `NULL` (usado para CPFs inválidos/ausentes do legado preservados em `cpf_legado_bruto`), mas bloqueia estritamente qualquer CPF válido duplicado dentro de `clientes_pf`.
+  * *Compatibilidade na Migração:* Como o bloqueio cruzado (Titular PF $\times$ Dependente PF) fica no **backend**, a carga inicial do `ABAC.FDB` não quebra caso haja registros históricos cruzados assinados no legado.
 
 ---
 
@@ -31,25 +34,57 @@
   3. **Meses sobrepostos (`YYMM`):** Parcelas futuras em aberto do carnê cancelado/substituído colidem com os meses do novo carnê caso não sejam deletadas (perdendo histórico no legado).
 
 * **Diretriz de Solução para o Schema Moderno (a revisar na versão final do SQL):**
-  * Como `parcelas` no PostgreSQL já possui `id BIGSERIAL PRIMARY KEY` e `num_carne` (FK para `carnes`), a unicidade estrutural de uma lâmina deve ser vinculada ao **carnê** (`(num_carne, anomes)` ou `(num_carne, id_parc)`), e **não** globalmente a `(num_adesao, anomes)`.
-  * Adicionar um campo de **situação/status da parcela** (ex.: `ABERTA`, `PAGA`, `QUITADA_POR_UNICA`, `CONSOLIDADA`, `CANCELADA`) para que parcelas futuras de carnês interrompidos sejam **canceladas logicamente (`CANCELADA`)** em vez de deletadas com `DELETE`, preservando 100% da auditoria.
-  * Para manter compatibilidade com chaves de busca de retorno CNAB/Excel que usam `(num_adesao, anomes)`:
-    * A unicidade rígida do banco passa a ser **`(num_carne, anomes)`** (garantindo que não haja repetição dentro do mesmo carnê);
-    * Para evitar cobrança mensal duplicada sem bloquear acordos parcelados no mesmo mês (ex.: mensalidade `2610` + parcela `02/04` do acordo também em `2610`), a restrição de "apenas 1 parcela ativa por mês" aplica-se apenas a **carnês mensais regulares (`CARNE_PF` / `BOLETO_PJ`)**, permitindo a convivência com carnês de `RENEGOCIACAO`;
-    * Taxas de adesão (`'0000'`) e reativações (`'REATIVACAO'`) nascem **`ABERTA`** dentro de seu próprio `num_carne` (`ADESAO` / `REATIVACAO`) e exigem liquidação (manual ou automática) como gatilho para efetivar o cliente e liberar a geração do carnê.
+  * **Regra Universal de Carnê (1 Parcela = 1 Carnê):** Toda e qualquer parcela/boleto do sistema pertence obrigatoriamente a **1 e somente 1 carnê** (`carnes`, via `num_carne NOT NULL`): carnê anual PF (`CARNE_PF`), fatura mensal PJ (`BOLETO_PJ`), taxa de adesão (`ADESAO`), taxa de reativação (`REATIVACAO`), acordo/renegociação (`RENEGOCIACAO`) ou cobrança de 2ª via (`SEGUNDA_VIA`).
+  * **Regra interna do banco de dados:** Alterar a unicidade estrutural da lâmina para **`(num_carne, anomes)`** (garantindo que não haja repetição dentro do mesmo carnê, mas permitindo novos carnês em reativações, reemissões no mesmo ano e acordos sem precisar da gambiarra `'YY98'`).
+  * **Preservação visual no Boleto e Carnê:** Essa alteração é **estritamente interna no banco de dados** — as colunas `num_adesao` e `anomes` permanecem intactas na tabela `parcelas` e continuam sendo exibidas normalmente no campo **`Nº do Documento`** do boleto/carnê (conforme padrão do item **1.5**), garantindo que colaboradoras e associados identifiquem facilmente a competência (`anomes`) mesmo quando várias parcelas atrasadas caírem no mesmo vencimento.
+  * **Classificação de Origem (`tipo_parcela`) e Status Financeiro (`situacao_parcela`):**
+    * **`tipo_parcela_enum` (`tipo_parcela`):** Define a natureza/origem exata de cada parcela:
+      1. `MENSALIDADE_PF` (parcelas mensais comuns `01/12`..`12/12` do carnê PF);
+      2. `COTA_UNICA_ANUAL` (lâmina opcional `'ÚNICA'` com desconto anual — nunca gera inadimplência);
+      3. `FATURA_MENSAL_PJ` (boleto mensal corporativo de empresa PJ);
+      4. `TAXA_ADESAO` (taxa inicial `'0000'` de entrada PF ou PJ — traz por padrão o valor definido na configuração/plano, com opção na tela de cadastro para isentar ou definir valor negociado no contrato);
+      5. `TAXA_REATIVACAO` (taxa de retorno/reativação de ex-cliente PF ou PJ — traz por padrão o valor da configuração/plano, também com opção de isentar ou negociar o valor);
+      6. `TAXA_MANUTENCAO` (taxa de manutenção anual do contrato PF ou PJ — traz por padrão o valor definido na configuração/plano, permitindo isentar ou negociar o valor no cadastro do contrato como margem comercial; nos carnês PF a partir do 2º ano vai somada/embutida na parcela `'01/12'` e na `'ÚNICA'`, registrada também na coluna `valor_taxa_manutencao_embutida NUMERIC(12,2) NOT NULL DEFAULT 0.00`, ou faturada no aniversário anual PJ quando não isenta);
+      7. `ACORDO_RENEGOCIACAO` (parcelas `REN 01/M`..`REN M/M` de acordo parcelado ou consolidação `'DEBIT'`);
+      8. `TAXA_SEGUNDA_VIA` (cobrança futura de emissão de 2ª via de cartão/carnê).
+    * **`situacao_parcela_enum` (`situacao_parcela`):** Define o estado financeiro no ciclo de vida da parcela:
+      1. `ABERTA` (não paga: *A Vencer* se `data_vencimento >= CURRENT_DATE`, ou *Vencida/Inadimplente* se `data_vencimento < CURRENT_DATE`);
+      2. `PAGA` (liquidada com entrada financeira real no caixa/banco: `valor_pago > 0`);
+      3. `QUITADA_POR_UNICA` (mensalidade `01/12`..`12/12` baixada em cascata com `valor_pago = 0.00` pelo pagamento da `COTA_UNICA_ANUAL`);
+      4. `RENEGOCIADA` (parcela original atrasada encerrada com `valor_pago = 0.00` e transferida para um acordo `ACORDO_RENEGOCIACAO` ainda em andamento);
+      5. `QUITADA_POR_ACORDO` (status assumido automaticamente pelas parcelas originais `RENEGOCIADA`, mantendo `valor_pago = 0.00` para não duplicar o caixa, no exato momento em que o cliente termina de pagar todas as $M$ parcelas do acordo vinculado);
+      6. `PERDOADA` (parcela antiga dispensada com `valor_pago = 0.00` mediante autorização de alçada de Gerente/Administrador na reativação);
+      7. `CANCELADA` (parcela futura de carnê interrompido/cancelado, preservando 100% da auditoria sem `DELETE` físico).
+  * **Trava contra mensalidade duplicada:** Para evitar cobrança mensal duplicada sem bloquear acordos parcelados no mesmo mês (ex.: mensalidade `2610` em um carnê `CARNE_PF` + parcela `02/04` do acordo também em `2610` em um carnê `RENEGOCIACAO` distinto), a restrição de "apenas 1 parcela ativa por mês" aplica-se no backend apenas a **carnês mensais regulares (`CARNE_PF` / `BOLETO_PJ`)**, permitindo a convivência com carnês de `RENEGOCIACAO` (e como estarão em `num_carne` diferentes, `(num_carne, anomes)` nunca colide).
+  * Taxas de adesão (`'0000'`) e reativações (`'REATIVACAO'`) nascem **`ABERTA`** dentro de seu próprio `num_carne` (`ADESAO` / `REATIVACAO`) e exigem liquidação (manual ou automática) como gatilho para efetivar o cliente e liberar a geração do carnê.
 
 ---
 
-### 1.3 Flag de Isenção da Taxa de Manutenção Anual Pós-Reativação
-* **Contexto:** Pela regra legada (`04_regras_negocio_financeiro_cnab_arquivos.md`), qualquer cliente que já tenha um `CARNE` anterior com `NUM_PARC = 12` recebe automaticamente o acréscimo de renovação $A$ (default R\$ 12,00) na parcela `01/12` e na `ÚNICA`.
-* **Necessidade Real:** Quando um cliente passa por **Reativação**, ele já paga a taxa de adesão/reativação no ato, portanto o **primeiro carnê gerado após a reativação NÃO deve cobrar a taxa de manutenção anual** ($A = 0,00$), exatamente como ocorre no 1º carnê de um cliente novo.
-* **Ação no Schema:** Prever mecanismo explícito (ex.: coluna `isento_taxa_proxima_renovacao BOOLEAN NOT NULL DEFAULT FALSE` em `clientes_pf` ou vínculo com registro de reativação) que o gerador de carnês consome e zera após emitir o carnê pós-reativação.
+### 1.3 Fila de Geração de Carnês (`fila_geracao_carnes`) e Isenção da Taxa de Manutenção Anual Pós-Reativação
+* **Conceito de Negócio (Taxa de Adesão vs. Taxa de Manutenção Anual):**
+  * No 1º ano (entrada do associado), cobra-se a **Taxa de Adesão** (`TAXA_ADESAO`, ou `TAXA_REATIVACAO` no retorno de ex-cliente). Por isso, o 1º carnê `CARNE_PF` (`12+1`) nunca possui acréscimo na `01/12` nem na `ÚNICA`.
+  * A partir do 2º ano (renovações anuais subsequentes de PF), aquele valor adicional somado à parcela `'01/12'` ($M + A$) e à `'ÚNICA'` ($(12 \times M \times 0,80) + A$) é oficialmente a **Taxa de Manutenção Anual** (que tem a mesma natureza da taxa de adesão, porém cobrada anualmente na renovação do carnê PF).
+  * **Regra Comercial para PF e PJ (Valor Padrão na Configuração + Opção de Isentar ou Negociar no Contrato):** Tanto para **PF** quanto para **PJ**, as duas taxas (**Taxa de Adesão/Reativação** e **Taxa de Manutenção Anual**) possuem **valor padrão oficial definido na configuração/plano** (criando margem/"gordura" comercial de negociação). Na tela de cadastro/contrato (e na reativação), o sistema exibe o valor padrão configurado e oferece a opção de **isentar** ou **informar um valor negociado** para aquele contrato (registrando em `clientes_pj` / `clientes_pf` se a taxa é isenta ou qual o valor negociado, respeitando a alçada de autorização quando aplicável).
+* **Necessidade Real na Reativação PF:**
+  * Quando um cliente PF passa por **Reativação**, ele já paga a taxa de reativação no ato (ou tem sua condição aprovada), portanto o **primeiro carnê `CARNE_PF` (`12+1`) gerado após a reativação NÃO deve cobrar a Taxa de Manutenção Anual** ($A = 0,00$), exatamente como ocorre no 1º carnê de um cliente novo.
+  * **Proteção contra conflito com Renegociação:** Um carnê de **`RENEGOCIACAO`** (que pode ocorrer antes ou depois da reativação) **nunca** cobra taxa de manutenção anual e **nunca** consome nem zera a isenção do cliente.
+* **Ação no Schema (Modelo Híbrido: Fila + Varredura):**
+  * Criar a tabela **`fila_geracao_carnes`** (`id`, `num_adesao`, `tipo_origem` [`ADESAO`, `REATIVACAO`], `parcela_gatilho_id` [`REFERENCES parcelas(id)`], `isento_taxa_manutencao BOOLEAN NOT NULL DEFAULT TRUE`, `status` [`PENDENTE`, `PROCESSADO`, `CANCELADO`], `carne_gerado_numero` [`REFERENCES carnes(numero)`], `created_at`, `processado_em`, `created_by`);
+  * **Regra Estrita da Fila e da Remessa de Carnês:**
+    * Apenas pedidos de carnê padrão **`12+1` (`tipo_carne = 'CARNE_PF'`)** entram em `fila_geracao_carnes` (disparados automaticamente na quitação da taxa de `ADESAO` ou `REATIVACAO` PF).
+    * Boletos de **`ADESAO`** (1 boleto), **`REATIVACAO`** (1 boleto), **`RENEGOCIACAO`** (acordo) e **`SEGUNDA_VIA`** **nunca** entram nessa fila nem na remessa periódica de geração de carnês — são impressos/enviados diretamente ao associado pelo operador no ato da operação.
+  * Na geração periódica de carnês (`CARNE_PF`), o sistema combina: (1) os itens `PENDENTE` de `fila_geracao_carnes` (sempre com Taxa de Manutenção Anual $A = 0,00$) e (2) a varredura de renovação dos clientes ativos existentes que atingiram o gatilho da `10/12` quitada dentro da janela de 60 dias (com $A = \text{valor\_taxa\_manutencao\_anual}$ do plano).
+  * *(Opcionalmente, manter também `isento_taxa_proxima_renovacao BOOLEAN NOT NULL DEFAULT FALSE` em `clientes_pf` como trava redundante, consumida **exclusivamente** por `tipo_carne = 'CARNE_PF'`.)*
 
 ---
 
-### 1.4 Separação entre Vencimento Real da Parcela e Vencimento Enviado na Remessa CNAB
+### 1.4 Separação entre Vencimento Real da Competência e Vencimento de Registro/Impressão
 * **Contexto:** Quando um cliente quita o carnê anterior com meses de atraso, as parcelas retroativas do novo carnê (ex.: março a julho geradas em julho) não podem ser registradas no banco com data de vencimento no passado (bancos rejeitam boletos vencidos na remessa).
-* **Necessidade Real:** Manter `parcelas.data_vencimento` com o **vencimento real/original** da competência (`anomes`, que também continua visível para o cliente e atendimento identificarem a qual mês a parcela pertence) e, na **geração do arquivo de remessa CNAB**, detectar vencimentos passados e ajustar a data enviada ao banco para o próximo vencimento válido do cliente (eventualmente registrando `data_vencimento_remessa` para rastreabilidade).
+* **Regra Crítica de Caixa/Impressão:** A data de vencimento impressa no carnê/boleto **DEVE ser idêntica** à data registrada no banco (CNAB 240), pois divergência entre o papel e o registro bancário faz o caixa/lotérica recusar o recebimento.
+* **Necessidade Real e Ação no Schema:**
+  * Manter `parcelas.data_vencimento` com o **vencimento real/original** da competência (`anomes`) para controle interno e histórico;
+  * Criar **`data_vencimento_remessa DATE`** (opcional, preenchida quando houver ajuste de vencimento passado para o próximo vencimento válido do cliente);
+  * Tanto na **remessa CNAB 240** quanto na **impressão do carnê/boleto em PDF**, utilizar obrigatoriamente **`COALESCE(data_vencimento_remessa, data_vencimento)`** como data de vencimento oficial, exibindo a competência original (`anomes` / `MM/AAAA`) no `Nº do Documento` e no campo de observação da lâmina.
 
 ---
 
@@ -68,10 +103,16 @@
 
 ### 1.6 Suporte a Renegociação / Acordo Parcelado (Relação `N:M` em vez de apenas `N:1`)
 * **Estado Atual no SQL Moderno:** `parcelas.parcela_consolidadora_id` aponta para apenas **1** parcela destino (atendendo somente o `'DEBIT'` à vista/`1x`).
-* **Necessidade Real:** Permitir que $N$ parcelas vencidas (ex.: 4 parcelas de R\$ 25,00 = R\$ 100,00) sejam renegociadas em $M$ novas parcelas de acordo (ex.: 3x de R\$ 33,33, podendo ter valores que não são múltiplos das parcelas originais, além de juros ou descontos).
-* **Ação no Schema:**
-  * Criar estrutura de vínculo `N:M` (ex.: tabela `renegociacoes` + `renegociacao_itens` ligando as parcelas originais ao carnê/parcelas do acordo, além de manter `parcela_consolidadora_id` ou `carne_acordo_id` conforme o desenho final).
-  * As parcelas originais recebem baixa técnica (`valor_pago = 0.00`, `situacao = 'RENEGOCIADA'` / `origem_baixa = 'CONSOLIDACAO_DEBIT'` ou `'RENEGOCIACAO'`), e as $M$ novas parcelas do acordo passam a ter `nosso_numero` próprio, registro CNAB e baixa automática pelo retorno bancário.
+* **Necessidade Real:** Permitir que $N$ parcelas vencidas (ex.: 4 parcelas de R\$ 25,00 = R\$ 100,00) sejam renegociadas em $M$ novas parcelas de acordo (ex.: 3x, sendo a 1ª parcela de R\$ 33,34 e as 2 demais de R\$ 33,33, podendo ter valores que não são múltiplos das parcelas originais, além de juros ou descontos).
+* **Regra de Arredondamento / Sobra de Centavos (Diferença na 1ª Parcela):** Quando a divisão do valor total negociado ($V_{\text{total}}$) por $M$ parcelas gerar sobra/resíduo de centavos ($V_{\text{base}} = \text{TRUNC}(V_{\text{total}} / M,\; 2)$ e $\text{sobra} = V_{\text{total}} - (M \times V_{\text{base}})$), **essa diferença entra obrigatoriamente na 1ª parcela do acordo (`REN 01/M`)** ($V_1 = V_{\text{base}} + \text{sobra}$ e $V_{2\dots M} = V_{\text{base}}$), garantindo que a soma das $M$ parcelas feche 100% com o valor negociado sem perda de centavos.
+* **Ação no Schema e Ciclo de Vida das Parcelas Originais vs. Acordo:**
+  * Criar estrutura de vínculo `N:M` (ex.: tabela `renegociacoes` + `renegociacao_itens` ligando as $N$ parcelas originais ao carnê/parcelas do acordo).
+  * **No momento em que o acordo é firmado:** As $N$ parcelas originais recebem baixa técnica de substituição com **`valor_pago = 0.00`** e **`situacao_parcela = 'RENEGOCIADA'`** (`origem_baixa = 'RENEGOCIACAO'`), saindo da fila de cobrança individual sem inflar o caixa, enquanto as $M$ novas parcelas do acordo nascem com **`tipo_parcela = 'ACORDO_RENEGOCIACAO'`**, **`situacao_parcela = 'ABERTA'`**, `nosso_numero` próprio, registro CNAB e baixa automática pelo retorno bancário.
+  * **No momento em que o cliente quita a última das $M$ parcelas do acordo:** As $N$ parcelas originais vinculadas àquele acordo têm seu status atualizado automaticamente de **`'RENEGOCIADA'`** para **`'QUITADA_POR_ACORDO'`** (permanecendo sempre com **`valor_pago = 0.00`** para jamais duplicar o caixa, já que o dinheiro entrou nas parcelas `ACORDO_RENEGOCIACAO`, funcionando exatamente como o `QUITADA_POR_UNICA`).
+  * **Impacto nos Relatórios de Inadimplência:** O Relatório de Clientes Inadimplentes (`REL-03`) terá:
+    1. **Filtro Geral de Inadimplentes (Padrão):** Lista todos os clientes com parcelas `ABERTA` e vencidas, englobando tanto mensalidades regulares (`MENSALIDADE_PF` / `FATURA_MENSAL_PJ`) quanto parcelas de acordo vencidas (`ACORDO_RENEGOCIACAO`);
+    2. **Filtro Exclusivo de Inadimplência de Renegociações:** Exibe apenas clientes que atrasaram parcelas de acordo (`tipo_parcela = 'ACORDO_RENEGOCIACAO'` com `situacao_parcela = 'ABERTA'` e vencidas);
+    3. **Filtro Exclusivo de Mensalidades Regulares:** Exibe apenas inadimplência de parcelas normais, sem acordos.
 
 ---
 
@@ -108,18 +149,20 @@
     * Na interface web e relatórios PDF, utilizar `COALESCE(nome_fantasia, razao_social)`.
 * **Nova Tabela `contas_cobranca` (Central de Contas Bancárias):**
   * Extrair os parâmetros bancários (`agencia`, `dv_agencia`, `conta`, `dv_conta`, `codigo_cedente`, `carteira`, `modalidade`, `percentual_multa`, `juros_mora_dia`, `codigo_banco`, `nsa_sequencial`, `padrao`, `ativo`, `created_by`, `updated_by`) para tabela própria vinculada à matriz.
+  * **Preparação Futura para API Bancária (`API_SICOOB_V3`):** Prever coluna `modo_integracao` (`CNAB_240` [padrão inicial] ou `API_SICOOB_V3`) e campos opcionais (`numero_cliente_sicoob`, `numero_contrato_cobranca`), mantendo credenciais/certificado e-CNPJ fora do banco (cofre de segredos).
   * Permite múltiplos bancos (Sicoob `756`, Caixa `104`, Banco do Brasil `001`, etc.) sem depender de colunas fixas por banco.
   * **Extinguir `banco_cobranca_enum`** e substituir as colunas `clientes_pf.banco_cobranca` e `lotes_arquivos.banco_cobranca` pela chave estrangeira **`conta_cobranca_id REFERENCES contas_cobranca(id)`**.
-* **Novas Tabelas de Gestão de Planos e Benefícios Adicionais:**
-  * Extrair os preços únicos (`valor_base_plano_pf`, `valor_adicional_dependente_pf`, `desconto_parcela_unica_percent`).
-  * Criar **`planos`**: cadastro de planos (ex.: *Básico*, *Plus*, *Básico + Funeral + Pet*), contendo `valor_titular`, `valor_dependente`, `valor_taxa_adesao`, `valor_acrescimo_renovacao`, `desconto_parcela_unica_percent`, `ativo`.
-  * Criar **`beneficios_adicionais`** (ex.: *Seguro Funeral*, *Seguro Casa*, *Cuidado Pet*) e vínculo **`cliente_beneficios_adicionais`** (N:M com o cliente, além de `plano_id` no cadastro do associado), permitindo tanto **pacotes prontos** quanto **plano base + benefícios agregados**.
+* **Novas Tabelas de Gestão de Planos, Combos, Benefícios Adicionais e Parâmetros Administrativos:**
+  * Extrair os preços únicos (`valor_base_plano_pf`, `valor_adicional_dependente_pf`, `desconto_parcela_unica_percent`) da antiga tabela `empresas`.
+  * Criar **`planos`**: cadastro de planos (ex.: *Básico*, *Bronze*, *Plus*), contendo `plano_base_id` (opcional -> `planos(id)`, quando o plano é um pacote montado sobre um plano base), `valor_titular`, `valor_dependente`, **`valor_taxa_adesao`** (matrícula), **`valor_taxa_reativacao`** (retorno de ex-cliente), **`valor_taxa_manutencao_anual`** (nomenclatura oficial que substitui o antigo *"acréscimo de renovação"*, representando a taxa anual cobrada a partir do 2º carnê PF na parcela `'01/12'` e na `'UNICA'`, **sem desconto** na cota única: `UNICA = (mensalidade * 12 * 0,80) + taxa_manutencao`), `desconto_parcela_unica_percent`, `ativo`, `created_by`, `updated_by`. Na criação de pacotes, o sistema soma `plano_base + adicionais` como **sugestão**, permitindo ao Administrador definir um preço final fechado diferente (ex.: desconto de combo).
+  * Criar **`beneficios_adicionais`** (ex.: *Seguro Funeral*, *Seguro Casa*, *Cuidado Pet*) e **`plano_beneficios_inclusos`** (N:M ligando quais adicionais já vêm embutidos em um plano pacote), além do vínculo avulso **`cliente_beneficios_adicionais`** (N:M com o cliente), permitindo tanto **pacotes prontos** quanto **plano base + benefícios agregados**.
+  * Criar **`configuracoes_sistema`** (área administrativa exclusiva do `ADMINISTRADOR`): armazena parâmetros globais de negócio que não devem ficar soltos na tela do operador, como **`max_parcelas_aberto_renovacao`** (tolerância de parcelas vencidas na renovação de carnês), **`janela_renovacao_carne_dias`** (default `60`) e os parâmetros de cobrança de 2ª via (**`cobrar_segunda_via_carne`** `BOOLEAN DEFAULT FALSE`, **`valor_segunda_via_carne`** `NUMERIC(12,2) DEFAULT 0.00`, **`cobrar_segunda_via_cartao`** `BOOLEAN DEFAULT FALSE`, **`valor_segunda_via_cartao`** `NUMERIC(12,2) DEFAULT 0.00`).
 
 ---
 
 ### 1.9 Auditoria Direta nas Tabelas (`created_by` e `updated_by`)
 * **Estado Atual no SQL Moderno:** As tabelas possuem `created_at` e `updated_at`, mas não possuem colunas diretas de autoria (`created_by` / `updated_by`), ficando a identificação do usuário apenas em `auditoria_eventos` (ou `baixado_por_usuario_id` em `parcelas`).
-* **Ação no Schema:** Padronizar **`created_by BIGINT REFERENCES usuarios(id)`** e **`updated_by BIGINT REFERENCES usuarios(id)`** em `empresas` e nas demais tabelas principais de cadastro/negócio (permitindo `NULL` para registros iniciais de seed/ETL legado).
+* **Ação no Schema:** Padronizar **`created_by BIGINT REFERENCES usuarios(id)`** e **`updated_by BIGINT REFERENCES usuarios(id)`** em `unidades` e nas demais tabelas principais de cadastro/negócio (permitindo `NULL` para registros iniciais de seed/ETL legado).
 
 ---
 
@@ -138,7 +181,8 @@
     8. **`PARCEIRO`** (rede credenciada — vê apenas seus próprios dados, tabelas, patrocínios e futuras autorizações/atendimentos).
   * **Isolamento Total de Dados (Escopo no Servidor + RLS):** Garantir no backend (e reforçar com *Row-Level Security* no PostgreSQL) que cada perfil acesse estritamente os registros vinculados à sua titularidade/unidade/parceiro.
   * **Permissões do Módulo de Parceiros:** Separar visualização (`perm_parceiros_consultar`), edição cadastral (`perm_parceiros_dados`), ajuste de tabelas de preços (`perm_parceiros_precos_editar`) e gestão de destaques (`perm_parceiros_destaques`), mantendo a alteração do cadeado CRM exclusiva de `ADMINISTRADOR`.
-  * **Substituir `empresa_id` por `unidade_id`** (`REFERENCES unidades(id)`), evitando redundância já que `unidades` pertence a `empresas` *(permitindo `NULL` para perfis externos, e obrigatório para `COLABORADOR`)*;
+  * **Permissão de Alçada Financeira:** Incluir **`perm_autorizar_desconto_perdao`** (atribuída a Administradores e Gerentes de unidade) para autorizar descontos em acordos ou perdão de dívidas antigas em reativações.
+  * **Substituir `empresa_id` por `unidade_id`** (`REFERENCES unidades(id)`), já que a antiga tabela `empresas` foi unificada e transformada na tabela `unidades` (que reúne Matriz e Filiais) *(permitindo `NULL` para perfis externos, e obrigatório para `COLABORADOR`)*;
   * **Escopo de Visibilidade por Unidade no RBAC:** Prever flag booleana de **visualização global** (vê todas as unidades) **e/ou** tabela associativa de **permissão regionalizada** (ex.: `usuario_unidades_acesso` listando quais unidades específicas aquele login pode visualizar, ex.: supervisor regional), mantendo como padrão apenas a própria `unidade_id`;
   * **Revisar integralmente a matriz de permissões (RBAC)** ao término da leitura de todas as tabelas e mapeamento das áreas do sistema.
 
@@ -190,6 +234,7 @@
 
 ### 1.15 Refatoração da Tabela `dependentes_pf` e Benefícios por Dependente
 * **Novas Colunas em `dependentes_pf`:**
+  * **`ativo BOOLEAN NOT NULL DEFAULT TRUE`**, **`data_exclusao DATE`** e **`motivo_exclusao TEXT`** (exclusão lógica / *soft delete*, substituindo o antigo `DELETE` físico; preserva histórico e libera o CPF imediatamente ao excluir; `created_at` registra a data de inclusão — no ETL do legado, preencher `created_at` com a `data_inscricao` do titular ou data da migração e `data_exclusao = NULL`);
   * `created_by` e `updated_by`;
   * `estado_civil` (padronizar com `clientes_pf` para cobrir: **Solteiro, Casado, Viúvo, Desquitado, Divorciado**);
   * `sexo` (mesmo enum abrangente de `clientes_pf`);
@@ -231,6 +276,7 @@
   * Adicionar **`nome_fantasia`** (`VARCHAR(100)`);
   * Adicionar **Representante Legal:** `representante_legal_nome`, `representante_legal_cpf` (validado Módulo 11), `representante_legal_telefone` (e flag WhatsApp opcional);
   * **Telefones:** Mesmo padrão de `clientes_pf` — substituir `telefone_comercial`, `telefone_residencial_fax` / `telefone_fax`, `telefone_celular` por **`telefone1`**, **`telefone2`**, **`telefone3`** + **`telefone1_whatsapp`**, **`telefone2_whatsapp`**, **`telefone3_whatsapp`** (`DEFAULT FALSE`), migrando no ETL na mesma ordem (`CELULAR -> 1`, `COMERCIAL -> 2`, `FAX -> 3`);
+  * Adicionar **Taxas Contratuais Negociáveis (Adesão/Reativação e Manutenção Anual PJ):** `isento_taxa_adesao BOOLEAN NOT NULL DEFAULT FALSE`, `valor_taxa_adesao_negociado NUMERIC(12,2)` (opcional; quando `NULL` e não isento, usa o padrão da configuração), `isento_taxa_manutencao_anual BOOLEAN NOT NULL DEFAULT FALSE`, `valor_taxa_manutencao_anual_negociado NUMERIC(12,2)` (opcional; permite usar as taxas padrão da configuração como margem comercial de negociação e conceder isenção ou desconto no fechamento do contrato PJ);
   * Adicionar **`created_by`** e **`updated_by`**;
   * Adicionar datas de ciclo de vida: `data_atualizacao`, `data_cancelamento`, `motivo_cancelamento`, `data_reativacao`;
   * Avaliar validação matemática de `cnpj` no ETL (Módulo 11 + dígitos repetidos $\to$ inválido preserva em `cnpj_legado_bruto` e grava `cnpj = NULL`) e unicidade de `cnpj` quando válido;
@@ -260,6 +306,7 @@
 ### 1.20 Replicação da Estrutura de `dependentes_pf` para `dependentes_func_pj`
 * **Estado Atual no SQL Moderno:** `dependentes_func_pj` possui apenas `id`, `funcionario_pj_id`, `nome`, `parentesco`, `data_nascimento`, `created_at` e `updated_at`.
 * **Ação no Schema:** Replicar integralmente o padrão definido para `dependentes_pf` (item **1.15**):
+  * Adicionar **`ativo BOOLEAN NOT NULL DEFAULT TRUE`**, **`data_exclusao DATE`** e **`motivo_exclusao TEXT`** (exclusão lógica / *soft delete*, preservando histórico; `created_at` registra a inclusão);
   * Adicionar **`cpf`**, **`cpf_legado_bruto`**, **`estado_civil`** (Solteiro, Casado, Viúvo, Desquitado, Divorciado), **`sexo`** abrangente, **`telefone`** (opcional, avaliar flag WhatsApp), **`email`** (opcional), **`valor_adicional`**, **`created_by`** e **`updated_by`**;
   * Criar vínculo **`dependente_func_pj_beneficios_adicionais`** (mesma regra de obrigatoriedade condicional quando possuir benefício que exija, ex.: Seguro Funeral);
   * Criar índices de **`nome` (`gin_trgm_ops`)**, **`cpf` (`WHERE cpf IS NOT NULL`)** e **`telefone`** (além de `funcionario_pj_id`).
@@ -270,16 +317,26 @@
 * **Auditoria:** Adicionar **`created_by BIGINT REFERENCES usuarios(id)`** (além de `created_at`).
 * **Quantidade Real de Parcelas (`13`) e `tipo_carne`:**
   * No legado (`CARNE.NUM_PARC`), o sistema gravava `12` para carnês PF (apesar de gerar `13` registros em `PARCELAS`: `ÚNICA` + `01/12`..`12/12`) e usava `NUM_PARC = 12` para detectar renovações.
-  * No sistema novo, gravar a quantidade **real** de parcelas geradas em `num_parcelas` (`13` para carnê PF, `1` para adesão/reativação/PJ, `M` para renegociação parcelada) e adicionar **`tipo_carne`** (`CARNE_PF`, `BOLETO_PJ`, `ADESAO`, `REATIVACAO`, `RENEGOCIACAO`) para distinguir claramente um carnê anual de um acordo parcelado (e na migração do legado, mapear `NUM_PARC = 12` para `tipo_carne = 'CARNE_PF'`).
+  * No sistema novo, gravar a quantidade **real** de parcelas geradas em `num_parcelas` (`13` para carnê PF, `1` para adesão/reativação/PJ, `M` para renegociação parcelada) e adicionar **`tipo_carne`** (`CARNE_PF`, `BOLETO_PJ`, `ADESAO`, `REATIVACAO`, `RENEGOCIACAO`, `SEGUNDA_VIA`) para distinguir claramente um carnê anual de um acordo parcelado ou cobrança de 2ª via (e na migração do legado, mapear `NUM_PARC = 12` para `tipo_carne = 'CARNE_PF'`).
+  * **Preservação da Numeração Visual (`id_parc`):** Apesar de `num_parcelas` registrar `13` no carnê PF, a numeração visual das parcelas em `parcelas.id_parc` **permanece obrigatoriamente como `'UNICA'` e `'01/12'` a `'12/12'`** (jamais `'01/13'..'13/13'`).
 
 ---
 
 ### 1.22 Demais Ajustes da Tabela `parcelas` (Em Revisão)
 * **Auditoria:** Adicionar **`created_by`** e **`updated_by`** (`REFERENCES usuarios(id)`), completando `created_at` e `updated_at`.
-* **`id_parc`:** Ampliar de `VARCHAR(10)` para **`VARCHAR(15)`**. Para parcelas de renegociação parcelada, adotar o padrão **`'REN 01/04'`** (conversando diretamente com `tipo_carne = 'RENEGOCIACAO'`), além de `'01/12'..'12/12'`, `'ÚNICA'`, `'ADESÃO'`, `'REATIVACAO'`, `'01/01'` (PJ) e `'DEBIT'` (legado 1x).
+* **Campos de Origem e Status (`tipo_parcela` e `situacao_parcela`):**
+  * Adicionar **`tipo_parcela tipo_parcela_enum NOT NULL`** (`MENSALIDADE_PF`, `COTA_UNICA_ANUAL`, `FATURA_MENSAL_PJ`, `TAXA_ADESAO`, `TAXA_REATIVACAO`, `TAXA_MANUTENCAO`, `ACORDO_RENEGOCIACAO`, `TAXA_SEGUNDA_VIA`);
+  * Adicionar **`situacao_parcela situacao_parcela_enum NOT NULL DEFAULT 'ABERTA'`** (`ABERTA`, `PAGA`, `QUITADA_POR_UNICA`, `RENEGOCIADA`, `QUITADA_POR_ACORDO`, `PERDOADA`, `CANCELADA`);
+  * Adicionar **`valor_taxa_manutencao_embutida NUMERIC(12, 2) NOT NULL DEFAULT 0.00`** para registrar, na parcela `'01/12'` e na `'UNICA'` dos carnês de renovação PF, quanto do `valor_nominal` corresponde à **Taxa de Manutenção Anual** ($A$) e quanto corresponde à mensalidade base ($M$).
+* **`id_parc`:** Ampliar de `VARCHAR(10)` para **`VARCHAR(15)`** (mantido como rótulo visual impresso no boleto/carnê, sem acento e em maiúsculas). Para carnês PF de `13` registros (`num_parcelas = 13`), manter obrigatoriamente a numeração **`'UNICA'`** e **`'01/12'` a `'12/12'`**. Para parcelas de renegociação parcelada, adotar o padrão **`'REN 01/04'`**, além de `'ADESAO'`, `'REATIVACAO'`, `'MANUTENCAO'`, `'01/01'` (PJ) e `'DEBIT'` (legado 1x).
 * **Obrigatoriedade de `baixado_por_usuario_id`:** Avaliar na migração entre:
   1. Atribuir o ID do administrador (ou usuário técnico de migração) a todas as baixas legadas e criar trava no banco garantindo obrigatoriedade **quando paga** (`CHECK (data_pagamento IS NULL OR baixado_por_usuario_id IS NOT NULL)`) — lembrando que parcelas em aberto precisam aceitar `NULL`; **ou**
   2. Manter livre para o histórico legado e exigir obrigatoriedade apenas no backend para todas as novas baixas no sistema novo.
+* **Abatimento de Parcelas e Instrução CNAB (`valor_abatimento`):**
+  * Adicionar **`valor_abatimento NUMERIC(12, 2) NOT NULL DEFAULT 0.00`** (mantendo o `valor_nominal` original do carnê impresso; o valor líquido a cobrar passa a ser `valor_nominal - valor_abatimento`) e **`abatimento_pendente_cnab BOOLEAN NOT NULL DEFAULT FALSE`** (para enfileirar parcelas já registradas no banco que precisam de instrução CNAB `'04'` Concessão de Abatimento ou `'05'` Cancelamento de Abatimento na próxima remessa ao Sicoob).
+* **Código de Barras, Linha Digitável e Boleto Híbrido Pix (`parcelas`):**
+  * Armazenar **`codigo_barras VARCHAR(44)`** e **`linha_digitavel VARCHAR(47)`** na tabela `parcelas` (calculados pelo sistema conforme regra oficial Sicoob no modo CNAB 240, ou gravados diretamente do retorno da API v3 no futuro), garantindo reprodutibilidade exata em reimpressões/2ª via;
+  * Prever colunas opcionais futuras **`pix_copia_cola TEXT`** e **`txid_pix VARCHAR(60)`** em `parcelas` para armazenar o QR Code Pix retornado pela API v3 do Sicoob e imprimi-lo diretamente nas lâminas dos carnês/boletos em PDF.
 
 ---
 
@@ -288,7 +345,8 @@
 * **Suporte a PJ:** Adicionar **`funcionario_pj_id`** (`REFERENCES funcionarios_pj(id)`) e **`dependente_func_pj_id`** (`REFERENCES dependentes_func_pj(id)`), ampliando `tipo_item` para incluir cartões de funcionários PJ e seus dependentes (`CARTAO_FUNC_PJ`, `CARTAO_DEP_PJ`).
 * **Preparação para Cobrança Futura (ex.: Cartão PVC / com Chip):**
   * Adicionar **`cobranca_obrigatoria BOOLEAN NOT NULL DEFAULT FALSE`** (hoje gratuita) e **`parcela_id BIGINT REFERENCES parcelas(id)`** (opcional).
-  * Quando cobrada no futuro, o pagamento (balcão em dinheiro, Pix, boleto CNAB 240, conferência de extrato) reaproveita integralmente a estrutura de `carnes` (`tipo_carne = 'SEGUNDA_VIA'`) + `parcelas` — sem duplicar tabelas financeiras — liberando a impressão somente após quitação da parcela vinculada.
+  * A fila lê automaticamente os parâmetros de `configuracoes_sistema` (`cobrar_segunda_via_carne`/`valor_segunda_via_carne` e `cobrar_segunda_via_cartao`/`valor_segunda_via_cartao`) para definir se o item exige pagamento.
+  * Quando cobrada no futuro, o pagamento (balcão em dinheiro, Pix, boleto CNAB 240, conferência de extrato) reaproveita integralmente a estrutura de `carnes` (`tipo_carne = 'SEGUNDA_VIA'`) + `parcelas` (`tipo_parcela = 'TAXA_SEGUNDA_VIA'`) — sem duplicar tabelas financeiras — liberando a impressão somente após quitação da parcela vinculada.
 * **Novos Índices:**
   * Índice parcial para itens pendentes: `(unidade_id, tipo_item, created_at) WHERE processado = FALSE`;
   * Histórico por contrato: `(num_adesao, created_at DESC)`;
@@ -853,6 +911,12 @@
   4. **Profissional (`profissional_id`, opcional):** **habilitado somente quando um Local foi escolhido no Passo 2**, listando apenas profissionais ativos naquele local e especialidade *(com botão de conveniência **"Aplicar para todas as filiais onde este profissional atende"**, que grava 1 linha por filial onde o profissional atua sem gerar empates)*;
   5. **Procedimento (`procedimento_id`) ou Descrição Livre (`descricao_beneficio`):** caixa pesquisável do catálogo geral (reaproveitando itens genéricos como `CONSULTA` combinados à especialidade do Passo 3) ou descrição livre (ex.: farmácias/comércios);
   6. **Grade de Convênios e Preços (`convenio_id`):** na ficha de parceiros credenciados, exibe lado a lado as colunas padrão (**Particular** e **Associado**) para digitação rápida; nas Clínicas Próprias (`UNIDADE_PROPRIA`), exibe todos os convênios ativos (**Particular**, **Associado**, **Parceiro**, **Prefeitura** e futuros).
+
+---
+
+### 1.26 Nova Tabela `autorizacoes_financeiras_excecao` (Alçada de Gerente / Código Único do Administrador)
+* **Objetivo:** Controlar e auditar solicitações de **desconto em renegociação** ou **perdão de dívida antiga na reativação** quando o operador não possui autonomia (`perm_autorizar_desconto_perdao`).
+* **Estrutura Prevista:** `id`, `unidade_id` (`REFERENCES unidades(id)`), `solicitante_usuario_id` (`REFERENCES usuarios(id)`), `tipo_operacao` (`PERDAO_DIVIDA_REATIVACAO`, `DESCONTO_RENEGOCIACAO`), `num_adesao` (`REFERENCES adesoes(numero)`), `valor_original NUMERIC(12,2)`, `valor_desconto_perdao NUMERIC(12,2)`, `motivo_solicitacao TEXT`, `modo_liberacao` (`SENHA_PRESENCIAL_GERENTE`, `CODIGO_UNICO_EMAIL`, `PAINEL_ADMIN`), `codigo_hash VARCHAR(255)` (hash do código aleatório único de uso único e validade curta), `expira_em TIMESTAMPTZ`, `autorizador_usuario_id` (`REFERENCES usuarios(id)`), `status` (`PENDENTE`, `APROVADA`, `REJEITADA`, `EXPIRADA`, `UTILIZADA`), `autorizado_em TIMESTAMPTZ`, `utilizado_em TIMESTAMPTZ`, `created_at TIMESTAMPTZ`.
 
 ---
 

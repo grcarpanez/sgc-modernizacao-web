@@ -87,9 +87,9 @@ Se $V_{\text{calc}} \neq \text{CLIENTES.VALOR\_PLANO}$:
 
 #### C. Fórmula Exata das 13 Parcelas do Carnê (`12` Mensais + `1` `ÚNICA` — `0x594a60..0x594f50`)
 Para cada cliente elegível com mensalidade base $M$ e dia de vencimento $D = \text{CLIENTES.DIAVENC} \in [1..28]$:
-1. Define-se o acréscimo de renovação $A$:
-   - Se for o **1º carnê** do cliente: $A = 0,00$.
-   - Se for **renovação** (já existe `CARNE` anterior com `NUM_PARC = 12`): $A = \text{ValorAcrescimo}$ (default `12,00`).
+1. Define-se a **Taxa de Manutenção Anual** $A$ *(chamada no legado de "Acréscimo de Renovação" / `ValorAcrescimo`, distinta da **Taxa de Adesão** na matrícula e da **Taxa de Reativação** no retorno de ex-cliente)*:
+   - Se for o **1º carnê** do cliente (após Taxa de Adesão) ou **1º carnê pós-reativação** (após Taxa de Reativação): $A = 0,00$.
+   - Se for **renovação** (a partir do 2º carnê PF): $A = \text{valor\_taxa\_manutencao\_anual}$ do plano (default `12,00` no legado), registrado na coluna `valor_taxa_manutencao_embutida` nas parcelas `'01/12'` e `'UNICA'` (**sem desconto** na cota única: $\text{UNICA} = (\text{mensalidade} \times 12 \times 0,80) + A$).
 2. Determina-se o **1º vencimento ($V_1$)**:
    - Se for 1º carnê: menor data $D/\text{MM}/\text{AAAA} \ge \text{Data de Emissão}$ (se $D/\text{mês atual} < \text{Hoje}$, avança para o mês seguinte).
    - Se for renovação: mês imediatamente subsequente ao vencimento da parcela `12/12` do último carnê (ou mês corrente/seguinte se o carnê anterior já expirou no passado), sempre no dia $D$.
@@ -412,6 +412,39 @@ Gerado em `TfrmGerarRemessa` tanto para **Entrada de Títulos (`Mov = '01'`)** q
 #### Trailer de Lote (`5`) e Trailer de Arquivo (`9`) — 240 bytes cada
 - **Trailer de Lote (`5`):** `1..8 = "75600015"`, `9..17 = 9 espaços`, `18..23 = PadLeftZero(qtd_reg_lote, 6)` (Header Lote + todos `P/Q/R` + Trailer Lote), `24..29 = PadLeftZero(qtd_titulos, 6)`, `30..46 = PadLeftZero(soma_valores_centavos, 17)`, `47..115 = 69 zeros`, `116..240 = 125 espaços`.
 - **Trailer de Arquivo (`9`):** `1..8 = "75699999"`, `9..17 = 9 espaços`, `18..23 = "000001"`, `24..29 = PadLeftZero(qtd_total_linhas_arquivo, 6)`, `30..35 = "000000"`, `36..240 = 205 espaços`.
+
+---
+
+### 3.3.1 Composição Oficial do Código de Barras (`44` dígitos) e Linha Digitável (`47` dígitos) — Sicoob (`756`)
+
+> **Fonte Oficial Verificada:** Planilha `documentos_auxiliares/Layouts_para_troca_de_informações - cooperativas.xls` (aba `02.Especificações do Boleto`). Esses campos devem ser calculados pelo sistema na geração direta dos carnês/boletos em PDF e persistidos em `parcelas.codigo_barras` (`VARCHAR(44)`) e `parcelas.linha_digitavel` (`VARCHAR(47)`).
+
+#### A. Código de Barras (`44` posições numéricas)
+| Posição | Tam. | Campo | Regra Exata |
+|---|---:|---|---|
+| `1..3` | 3 | Banco | `"756"` (Código do Sicoob na câmara de compensação) |
+| `4..4` | 1 | Moeda | `"9"` (Real) |
+| `5..5` | 1 | DV Geral (`L`) | **Módulo 11** (pesos `2..9` da direita para a esquerda sobre os 43 dígitos restantes; se `11 - resto` for `0`, `1` ou `> 9`, assume **`"1"`**) |
+| `6..9` | 4 | Fator de Vencimento (`MMMM`) | Para vencimentos $\ge$ **`22/02/2025`**: `(data_vencimento - 22/02/2025) + 1000` *(para datas anteriores: `(data_vencimento - 03/07/2000) + 1000`; sem vencimento: `"0000"`)* |
+| `10..19` | 10 | Valor (`NNNNNNNNNN`) | `PadLeftZero(Round(valor_boleto * 100), 10)` *(zeros se valor em aberto)* |
+| `20..20` | 1 | Carteira (`C`) | Código da carteira Sicoob (1 dígito, ex.: `"1"`) |
+| `21..24` | 4 | Agência / Cooperativa (`DDDD`) | `PadLeftZero(agencia, 4)` |
+| `25..26` | 2 | Modalidade (`FF`) | `PadLeftZero(modalidade, 2)` |
+| `27..33` | 7 | Código do Beneficiário (`GGGGGGG`) | `PadLeftZero(codigo_cedente, 7)` |
+| `34..41` | 8 | Nosso Número (`HHHHHHHH`) | `PadLeftZero(nosso_numero_7dig + dv_nosso_numero, 8)` *(DV calculado por Módulo 11 peso cíclico `3197` sobre os 21 dígitos)* |
+| `42..44` | 3 | Número da Parcela (`JJJ`) | `PadLeftZero(num_parcela, 3)` (ex.: `"001"`..`"012"`; `"001"` se parcela única / boleto avulso) |
+
+#### B. Linha Digitável (`47` dígitos em 5 Campos: `AAABC.DDDDE  FFGGG.GGGGHI  HHHHH.HHJJJK  L  MMMMNNNNNNNNNN`)
+1. **Campo 1 (`AAABC.DDDDE` — 10 dígitos + 1 DV):** `Banco(3)` + `Moeda(1)` + `Carteira(1)` + `Agência(4)` + **`E` (DV Módulo 10)**;
+2. **Campo 2 (`FFGGG.GGGGHI` — 10 dígitos + 1 DV):** `Modalidade(2)` + `Código Beneficiário(7)` + `1º dígito do Nosso Número(1)` + **`I` (DV Módulo 10)**;
+3. **Campo 3 (`HHHHH.HHJJJK` — 10 dígitos + 1 DV):** `7 dígitos restantes do Nosso Número(7)` + `Parcela(3)` + **`K` (DV Módulo 10)**;
+4. **Campo 4 (`L` — 1 dígito):** DV Geral do Código de Barras (posição `5` do código de barras, **Módulo 11**);
+5. **Campo 5 (`MMMMNNNNNNNNNN` — 14 dígitos):** `Fator de Vencimento(4)` + `Valor em centavos(10)`.
+
+#### C. Regra do Módulo 10 (para os DVs `E`, `I` e `K` dos Campos 1, 2 e 3)
+* Multiplicar cada dígito do campo da **direita para a esquerda** alternando os pesos **`2, 1, 2, 1...`**;
+* Se qualquer produto for `> 9`, somar os algarismos do produto até reduzir a 1 dígito (ex.: `18` $\to$ `1 + 8 = 9`);
+* Somar todos os resultados, encontrar a dezena imediatamente superior (ou igual) à soma e subtrair a soma (ex.: soma `25` $\to$ `30 - 25 = 5`; se a soma for múltipla de 10, DV = `0`).
 
 ---
 

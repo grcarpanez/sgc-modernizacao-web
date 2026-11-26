@@ -111,7 +111,11 @@ Todos os 6 relatórios renderizam no topo da primeira página (ou topo de cada p
 - **Acionamento no Legado:** Menu `Relatórios -> Clientes Inadimplentes` (`Ctrl+I`) -> `TFrmRelatoriosClientes` (`Tipo = 'INADIMPLENTES'`).
 - **Parâmetros de Filtro:**
   - `AteData` (`DData`): Data de corte de vencimento (`DTVENC <= :ate_data`, default `CURRENT_DATE`).
-  - Filtro opcional dinâmico: campo cadastral de `CLIENTES` ou `NOME DO CADASTRANTE` (`CONVENIOS.NOME ILIKE :texto`).
+  - **Filtro de Modalidade de Inadimplência (Novo Sistema Web — baseado em `tipo_parcela` e `situacao_parcela = 'ABERTA'`):**
+    1. **`GERAL` (Padrão):** Exibe todos os clientes inadimplentes, somando tanto **Mensalidades Regulares vencidas** (`tipo_parcela = 'MENSALIDADE_PF'`) quanto **Parcelas de Renegociação/Acordo vencidas** (`tipo_parcela = 'ACORDO_RENEGOCIACAO'`);
+    2. **`APENAS_RENEGOCIACOES`:** Exibe exclusivamente clientes com inadimplência em parcelas de **Acordo / Renegociação** (`tipo_parcela = 'ACORDO_RENEGOCIACAO'` vencidas e em aberto);
+    3. **`APENAS_MENSALIDADES`:** Exibe apenas clientes com mensalidades regulares de carnê vencidas (`tipo_parcela = 'MENSALIDADE_PF'`).
+  - Filtro opcional dinâmico: campo cadastral de `CLIENTES` ou Unidade (`unidades.nome ILIKE :texto`).
 - **Query SQL Exata:**
   ```sql
   SELECT

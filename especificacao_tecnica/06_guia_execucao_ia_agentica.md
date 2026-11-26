@@ -10,10 +10,10 @@ Qualquer agente de IA que implemente este sistema **DEVE** obedecer rigorosament
 
 1. **Aritmética Monetária Exata:** Jamais usar `float` ou `double` binário IEEE-754 para valores monetários, percentuais de comissão ou tarifas. Usar exclusivamente `Decimal` (`Python decimal.Decimal` com `ROUND_HALF_UP`) ou `BigDecimal` (`Java math.BigDecimal` com `RoundingMode.HALF_UP`) e `NUMERIC(12,2)` no PostgreSQL.
 2. **Unicidade Global do Número de Adesão (`adesoes.numero`):** O número de adesão é compartilhado entre **Clientes PF (`clientes_pf`)** e **Empresas Clientes PJ (`clientes_pj`)** através da supertabela `adesoes` alimentada por `seq_adesao_numero` (sincronizada após migração com `MAX(NUMERO) + 1`).
-3. **Fórmula Exata da Cota Anual `'ÚNICA'`:** Ao gerar um carnê de 12 parcelas com mensalidade base $M = V_{\text{titular}} + (N_{\text{dep}} \times V_{\text{dep}})$ e acréscimo de renovação $A$ ($A = 0$ no 1º carnê; $A = V_{\text{acrescimo}}$ na renovação), gerar **13 parcelas**:
+3. **Fórmula Exata da Cota Anual `'UNICA'`:** Ao gerar um carnê PF (`num_parcelas = 13`, mantendo os rótulos visuais `'UNICA'` e `'01/12'`..`'12/12'`) com mensalidade base $M$ e **Taxa de Manutenção Anual** $A$ ($A = 0$ no 1º carnê após Taxa de Adesão e no 1º carnê após Taxa de Reativação; $A = \text{valor\_taxa\_manutencao\_anual}$ do plano a partir do 2º carnê), o desconto de 20% incide **exclusivamente sobre as 12 mensalidades (sem desconto na taxa)**, registrando $A$ em `valor_taxa_manutencao_embutida`:
    - `'01/12'` = $M + A$;
    - `'02/12'`..`'12/12'` = $M$;
-   - `'ÚNICA'` (`ANOMES = AA + '99'`, mesmo `DTVENC` da `'01/12'`) = $\text{ROUND}(12 \times M \times 0,80 + A,\; 2)$.
+   - `'UNICA'` (`ANOMES = AA + '99'`, mesmo `DTVENC` da `'01/12'`) = $\text{ROUND}(12 \times M \times 0,80 + A,\; 2)$.
 4. **Cascata Atômica da `'ÚNICA'`:** A liquidação de qualquer parcela `ID_PARC = 'ÚNICA'` (seja por baixa manual, retorno CNAB 240 ou planilha) deve, **na mesma transação de banco de dados**, quitar todas as parcelas mensais em aberto do mesmo `carne_id` com `dt_pagamento = mesma_data`, `valor_pago = 0.00`, `valor_compensacao = 0.00` e `situacao_parcela = 'QUITADA_POR_UNICA'`. O estorno deve reverter a cascata atomicamente.
 5. **Exclusão da `'ÚNICA'` em Inadimplência e Previsão de Recebíveis:** Parcelas com `id_parcela = 'ÚNICA'` jamais podem ser contabilizadas como vencidas/inadimplentes nem somadas em *Contas a Receber*.
 6. **Consolidação `'DEBIT'` Sem Inflar Caixa:** Ao consolidar parcelas atrasadas em uma parcela única `'DEBIT'` (`ANOMES = AA + '00'`), as parcelas originais são marcadas como `CONSOLIDADA` com `valor_pago = 0.00` (para saírem da inadimplência sem somar falsamente em *Contas Recebidas*).
@@ -128,8 +128,8 @@ Todos os endpoints (exceto `/api/v1/auth/login` e `/api/v1/health`) exigem cabe�
 ### 4.3 Operações Financeiras, Remessas, Baixas e Atendimento
 - `POST /api/v1/adesoes/lote` (`{ quantidade, banco }`) -> Gera fichas + `ANOMES='0000'` + arquivo `REMADESAO{rem:05d}.TXT`.
 - `GET /api/v1/adesoes/disponiveis` -> Lista fichas pré-geradas ainda não utilizadas e exporta arquivo `REMADESAO` (`TFrmRecuperarArquivo` opção 2).
-- `POST /api/v1/carnes-pf/simular` (`{ valor_titular, valor_dependente, valor_acrescimo_renovacao, max_parcelas_aberto }`) -> Retorna lista de clientes elegíveis, flag `eh_renovacao`, divergências de `valor_plano` e totais.
-- `POST /api/v1/carnes-pf/gerar-lote` -> Efetiva os carnês de 13 parcelas (`12` + `'ÚNICA'`), avança `DATA_ARQ` e gera `REMESSA{rem:07d}_{banco}.TXT`.
+- `POST /api/v1/carnes-pf/simular` -> Lê as configurações vigentes de `planos` e `configuracoes_sistema` (`valor_taxa_manutencao_anual`, `desconto_parcela_unica_percent`, `max_parcelas_aberto_renovacao`, `janela_renovacao_carne_dias`), retorna essas configurações na tela junto com a lista de clientes elegíveis, flag `eh_renovacao`, `isento_taxa_manutencao` e totais, aguardando confirmação explícita do operador.
+- `POST /api/v1/carnes-pf/gerar-lote` -> Executado somente após confirmação da prévia pelo operador; efetiva os carnês de 13 parcelas (`'01/12'`..`'12/12'` + `'UNICA'`), registrando `valor_taxa_manutencao_embutida`, e gera os PDFs do lote.
 - `POST /api/v1/faturamento-pj/simular` & `POST /api/v1/faturamento-pj/gerar-lote` (`{ competencia_mes_ano }`) -> Gera faturas PJ somando funcionários `SITUACAO = 'A'` + `REMESSA{rem:07d}.TXT`.
 - `GET /api/v1/inadimplencia/candidatos-consolidacao` (`?max_parcelas_aberto=3`) -> Lista clientes inadimplentes elegíveis (`TfrmGerarRemessa` Aba 1).
 - `POST /api/v1/inadimplencia/consolidar-debit` (`{ numeros_adesao[], dt_novo_vencimento }`) -> Consolida atrasados em parcela `'DEBIT'`.
@@ -225,9 +225,9 @@ A implementação só deve ser considerada concluída pela IA agêntica quando t
    - **Quando** calculado pelos pesos `[3,1,9,7,...]`;
    - **Então** retorna exatamente o dígito verificador esperado (tratando restos `0` e `1` como DV `0`) e formata `pos 38..47` do Segmento `P` com 10 caracteres numéricos.
 2. **`test_carne_pf_13_parcelas_primeiro_vs_renovacao`:**
-   - **Dado** titular ativo com adesão `'0000'` paga, `2` dependentes, `ValorTitular = 12.00`, `ValorDep = 2.00` ($M = 16.00$), `Acrescimo = 12.00`;
-   - **Quando** gerado **1º carnê**: cria 13 parcelas onde `'01/12' = 16.00`, `'02/12'..'12/12' = 16.00` e `'ÚNICA'` (`AA99`) `= 153.60`;
-   - **Quando** gerado **carnê de renovação**: cria 13 parcelas onde `'01/12' = 28.00`, `'02/12'..'12/12' = 16.00` e `'ÚNICA'` (`AA99`) `= 165.60`.
+   - **Dado** titular ativo com Taxa de Adesão `'0000'` paga, `2` dependentes, mensalidade base $M = 16.00$ e `valor_taxa_manutencao_anual = 12.00`;
+   - **Quando** gerado **1º carnê**: cria 13 parcelas onde `'01/12' = 16.00`, `'02/12'..'12/12' = 16.00`, `'UNICA'` (`AA99`) `= 153.60` e `valor_taxa_manutencao_embutida = 0.00`;
+   - **Quando** gerado **carnê de renovação (a partir do 2º carnê)**: cria 13 parcelas onde `'01/12' = 28.00` (`valor_taxa_manutencao_embutida = 12.00`), `'02/12'..'12/12' = 16.00` e `'UNICA'` (`AA99`) `= 165.60` (`153.60 + 12.00` sem desconto na taxa, com `valor_taxa_manutencao_embutida = 12.00`).
 3. **`test_baixa_parcela_unica_cascata_e_estorno`:**
    - **Dado** carnê de 13 parcelas em aberto;
    - **Quando** liquidada a parcela `'ÚNICA'` por `R\$ 165,60` com tarifa `R\$ 2,50`;
